@@ -504,6 +504,9 @@ class NxcAutomator:
         netexec_timeout: int = NETEXEC_TIMEOUT,
         subprocess_timeout: int = SUBPROCESS_TIMEOUT,
         max_retry: int = MAX_RETRY,
+        stop_on_success: bool = False,
+        only_protocols: str | None = None,
+        exclude_protocols: str | None = None,
     ):
         self.targets = self._read_value_or_file(target)
         self.mode = mode.lower()
@@ -529,6 +532,9 @@ class NxcAutomator:
         self.netexec_timeout = netexec_timeout
         self.subprocess_timeout = subprocess_timeout
         self.max_retry = max_retry
+        self.stop_on_success = stop_on_success
+        self.only_protocols = self._parse_protocol_set(only_protocols, "only")
+        self.exclude_protocols = self._parse_protocol_set(exclude_protocols, "exclude") or set()
         self.lock = Lock()
         self.cmd_log_lock = Lock()
         self.completed = 0
@@ -569,6 +575,20 @@ class NxcAutomator:
         self.valid_creds: list[dict] = []
         self.domain_hosts: dict[str, set[str]] = {}  # domain → {hostnames}
         self.host_domain: dict[str, str] = {}        # host → domain
+
+    @staticmethod
+    def _parse_protocol_set(value: str | None, flag: str) -> set[str] | None:
+        """Parse a comma-separated protocol list, validating against ALL_PROTOCOLS."""
+        if not value:
+            return None
+        protos = {p.strip().lower() for p in value.split(",") if p.strip()}
+        unknown = protos - set(ALL_PROTOCOLS)
+        if unknown:
+            raise ValueError(
+                f"--{flag}: unknown protocol(s) {sorted(unknown)}. "
+                f"Valid: {', '.join(ALL_PROTOCOLS)}"
+            )
+        return protos
 
     @staticmethod
     def _all_known_ports() -> list[int]:
@@ -635,12 +655,15 @@ class NxcAutomator:
         """Return standardized display label for protocol/auth scope."""
         return f"{protocol.upper()} ({self._auth_scope(local_auth)})"
 
-    @staticmethod
-    def _build_protocol_tasks(open_ports: set[int] | None = None) -> list[TaskKey]:
-        """Generate (protocol, local_auth) tasks. If open_ports is given, drop
-        protocols whose mapped ports are all closed."""
+    def _build_protocol_tasks(self, open_ports: set[int] | None = None) -> list[TaskKey]:
+        """Generate (protocol, local_auth) tasks. Filters by --only / --exclude
+        and (when --nmap is on) drops protocols whose mapped ports are all closed."""
         tasks: list[TaskKey] = []
         for protocol in ALL_PROTOCOLS:
+            if self.only_protocols and protocol not in self.only_protocols:
+                continue
+            if protocol in self.exclude_protocols:
+                continue
             if open_ports is not None:
                 mapped = PROTOCOL_PORTS.get(protocol, [])
                 if not any(p in open_ports for p in mapped):
@@ -800,14 +823,26 @@ class NxcAutomator:
             return False
         return True
 
+    @staticmethod
+    def _is_pwn3d(msg: str) -> bool:
+        """nxc appends '(Pwn3d!)' when the auth grants admin on the host."""
+        return "(Pwn3d!)" in msg or "(pwn3d!)" in msg.lower()
+
     def _report_success_lines(self, stdout: str, protocol: str, local_auth: bool):
         for raw_line in stdout.split("\n"):
             marker, msg = self._parse_nxc_line(raw_line.strip())
             if marker == "[+]":
                 label = self._task_label(protocol, local_auth)
-                self._print_live(
-                    f"  {GREEN}{BOLD}⚡ {label}{RESET} {GREEN}{msg}{RESET}"
-                )
+                if self._is_pwn3d(msg):
+                    # Loud red banner for admin-on-host — this is the report-worthy line.
+                    self._print_live(
+                        f"  {RED}{BOLD}💀 PWN3D! {label}{RESET} "
+                        f"{RED}{BOLD}{msg}{RESET}"
+                    )
+                else:
+                    self._print_live(
+                        f"  {GREEN}{BOLD}⚡ {label}{RESET} {GREEN}{msg}{RESET}"
+                    )
             elif marker == "[-]" and self.verbosity >= V_VERBOSE:
                 label = self._task_label(protocol, local_auth)
                 self._vprint(V_VERBOSE, f"  {DIM}✘ {label} {msg}{RESET}")
@@ -928,6 +963,23 @@ class NxcAutomator:
                     timeout_count += 1
                 else:
                     timeout_count = 0
+
+                # Stop-on-success: bail out of this protocol/host as soon as we
+                # see a [+] line, so we don't keep trying the rest of the
+                # credentials (and risk account lockout).
+                if self.stop_on_success and "[+]" in stdout:
+                    ran += 1
+                    self._update_progress()
+                    remaining = total_per_task - ran
+                    if remaining > 0:
+                        self._skip_progress(remaining)
+                    label = self._task_label(protocol, local_auth)
+                    self._vprint(
+                        V_VERBOSE,
+                        f"  {DIM}↷ stop-on-success: {label} → skipping "
+                        f"remaining {remaining} cred(s) on this host{RESET}",
+                    )
+                    return output_lines
             except subprocess.TimeoutExpired:
                 timeout_count += 1
 
@@ -1036,6 +1088,15 @@ class NxcAutomator:
             pacing.append(f"retry={self.max_retry}")
         if pacing:
             print(f"  Pacing          {DIM}│{RESET} {BOLD}{' · '.join(pacing)}{RESET}")
+        filters: list[str] = []
+        if self.only_protocols:
+            filters.append(f"only={','.join(sorted(self.only_protocols))}")
+        if self.exclude_protocols:
+            filters.append(f"exclude={','.join(sorted(self.exclude_protocols))}")
+        if self.stop_on_success:
+            filters.append("stop-on-success")
+        if filters:
+            print(f"  Filters         {DIM}│{RESET} {BOLD}{' · '.join(filters)}{RESET}")
         if self.scan_only:
             print(f"  {YELLOW}{BOLD}⚠ scan-only mode — no auth attempts will run{RESET}")
         else:
@@ -1102,7 +1163,10 @@ class NxcAutomator:
                     prefix = f"      {'':<20}"
 
                 if marker == "[+]":
-                    print(f"{prefix} {GREEN}{msg}{RESET}")
+                    if self._is_pwn3d(msg):
+                        print(f"{prefix} {RED}{BOLD}💀 {msg}{RESET}")
+                    else:
+                        print(f"{prefix} {GREEN}{msg}{RESET}")
                     successes.append((label, msg))
                 elif marker == "[-]":
                     print(f"{prefix} {DIM}{msg}{RESET}")
@@ -1117,9 +1181,15 @@ class NxcAutomator:
         print(f"\n{'─' * BANNER_WIDTH}")
 
         if successes:
+            pwn3d_hits = [s for s in successes if self._is_pwn3d(s[1])]
+            if pwn3d_hits:
+                print(f"\n  {RED}{BOLD}💀 ADMIN PWN3D ({len(pwn3d_hits)}){RESET}\n")
+                for label, msg in pwn3d_hits:
+                    print(f"    {RED}{BOLD}►{RESET} {BOLD}{label:<20}{RESET} {DIM}│{RESET} {RED}{msg}{RESET}")
             print(f"\n  {GREEN}{BOLD}✓ VALID CREDENTIALS{RESET}\n")
             for label, msg in successes:
-                print(f"    {GREEN}►{RESET} {BOLD}{label:<20}{RESET} {DIM}│{RESET} {msg}")
+                icon = f"{RED}{BOLD}►{RESET}" if self._is_pwn3d(msg) else f"{GREEN}►{RESET}"
+                print(f"    {icon} {BOLD}{label:<20}{RESET} {DIM}│{RESET} {msg}")
             print()
         else:
             print(f"\n  {RED}{BOLD}✗ No valid credentials found.{RESET}\n")
@@ -1408,10 +1478,30 @@ class NxcAutomator:
                 protos.append(proto.upper())
         return ", ".join(protos) if protos else "none"
 
+    @staticmethod
+    def _is_nxc_available() -> bool:
+        try:
+            subprocess.run(["nxc", "--version"], capture_output=True, timeout=5)
+            return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
     def run(self):
         task_count = len(ALL_PROTOCOLS) + len(LOCAL_AUTH_PROTOCOLS)
         pair_count = len(self.credentials)
         total_attempts = len(self.targets) * pair_count * task_count
+
+        # Pre-flight: fail fast if nxc isn't installed — otherwise every
+        # attempt will produce an unhelpful 'No such file or directory' error.
+        # --scan-only doesn't need nxc, so skip the check in that path.
+        if not self.scan_only and not self._is_nxc_available():
+            print(
+                f"\n  {RED}{BOLD}✗ nxc not found in PATH.{RESET}\n"
+                f"  {DIM}Install with:{RESET} {BOLD}./scripts/update-nxc.sh{RESET}\n"
+                f"  {DIM}or:           {RESET} {BOLD}pipx install netexec{RESET}\n",
+                file=sys.stderr,
+            )
+            sys.exit(127)
 
         if self.nmap_enabled and self.scanner is not None and not NmapScanner.is_available():
             print(f"  {YELLOW}{BOLD}⚠ nmap not found in PATH — disabling pre-scan{RESET}\n")
@@ -1476,7 +1566,10 @@ class NxcAutomator:
                         if self.verbosity == V_QUIET:
                             for entry in host_valid:
                                 label = self._task_label(entry["protocol"], entry["local_auth"])
-                                print(f"  {GREEN}► {host}{RESET} {BOLD}{label:<20}{RESET} {GREEN}{entry['raw']}{RESET}")
+                                if self._is_pwn3d(entry["raw"]):
+                                    print(f"  {RED}{BOLD}💀 {host}{RESET} {BOLD}{label:<20}{RESET} {RED}{entry['raw']}{RESET}")
+                                else:
+                                    print(f"  {GREEN}► {host}{RESET} {BOLD}{label:<20}{RESET} {GREEN}{entry['raw']}{RESET}")
                         self._post_exploit_host(host, host_valid)
 
             if self.bloodhound_enabled:
@@ -1538,6 +1631,10 @@ def parse_args():
     g_target = parser.add_argument_group("target")
     g_target.add_argument("-t", "--target", required=True,
                           help="Target IP/hostname/CIDR, or path to a targets file (one per line).")
+    g_target.add_argument("--only",
+                          help="Comma-separated protocols to include (e.g. smb,ldap).")
+    g_target.add_argument("--exclude",
+                          help="Comma-separated protocols to exclude (e.g. vnc,rdp,nfs).")
 
     # ----- Credentials -----
     g_auth = parser.add_argument_group(
@@ -1609,6 +1706,9 @@ def parse_args():
                         help=f"Hard Python timeout per nxc invocation (default: {SUBPROCESS_TIMEOUT}).")
     g_perf.add_argument("--max-retry", type=int, default=MAX_RETRY,
                         help=f"Skip a protocol after N consecutive connectivity timeouts (default: {MAX_RETRY}).")
+    g_perf.add_argument("--stop-on-success", action="store_true",
+                        help="Stop testing credentials on a protocol/host as soon as one valid cred is found "
+                             "(avoids lockout and saves time).")
 
     # ----- Output / logging -----
     g_out = parser.add_argument_group("output & logging")
@@ -1684,6 +1784,9 @@ def main():
             netexec_timeout=args.netexec_timeout,
             subprocess_timeout=args.subprocess_timeout,
             max_retry=args.max_retry,
+            stop_on_success=args.stop_on_success,
+            only_protocols=args.only,
+            exclude_protocols=args.exclude,
         )
         runner.run()
     except ValueError as exc:
