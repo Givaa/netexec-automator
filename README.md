@@ -1,5 +1,7 @@
 # NetExec Automator
 
+[![CI](https://github.com/Givaa/netexec-automator/actions/workflows/ci.yml/badge.svg)](https://github.com/Givaa/netexec-automator/actions/workflows/ci.yml)
+
 > Spray [NetExec](https://github.com/Pennyw0rth/NetExec) across **all 10 protocols** in parallel — with nmap pre-scan, hash & Kerberos auth, auto-enum, BloodHound collection, and a shell-pasteable commands transcript for your report.
 
 ![NetExec Automator Demo](assets/netexec-automator-demo.gif)
@@ -354,6 +356,21 @@ Defaults at the top of `netexec-automator.py`. The CLI flags above override all 
 | `BLOODHOUND_TIMEOUT` | `600` | Hard timeout per `bloodhound-python` invocation |
 
 ---
+
+## Development
+
+```bash
+# Run the test suite
+python3 -m venv .venv && source .venv/bin/activate
+pip install pytest
+pytest tests/ -v
+```
+
+Tests cover parsers (hash detection, combo file, Pwn3d, lockout/SAM regex), the command builder (domain suppression on `--local-auth`, Kerberos only on supported protocols), the credential matcher (password / hash / null-session / Guest), protocol filters, the TOML loader, and DNS SRV parsing. Add a test before fixing a bug.
+
+CI runs the same suite on Python 3.10–3.13 and lints `scripts/*.sh` on every push and PR. See [.github/workflows/ci.yml](.github/workflows/ci.yml).
+
+To refresh the demo GIF, install `asciinema` and `agg` and run `./scripts/record-demo.sh` — it walks you through the recording, then renders the cast to the path linked in this README.
 
 ## Disclaimer
 
