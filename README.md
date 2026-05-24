@@ -322,6 +322,40 @@ Override the path with `--cmd-log /path/to/file`. Disable with `--no-cmd-log`.
 
 ---
 
+## Status icons & error handling
+
+Every post-exploit and live action uses one of these icons; the meaning is **stable** across the whole tool:
+
+| Icon | Meaning |
+|------|---------|
+| ✔ green | action produced real, actionable data |
+| ⊘ yellow | ran cleanly but nothing to show (e.g. `STATUS_ACCESS_DENIED`, `--ntds` on non-DC, no domain cred for BloodHound) — **expected, not a bug** |
+| ✘ red | real failure: subprocess exit ≠ 0, I/O error, cracker explosion |
+| ⚠ yellow | warning: feature degraded/disabled, lockout risk, flag combo can't produce results |
+| ⏱ yellow | network-level timeout |
+| ↷ grey | deliberately skipped (filter, dedup, `--stop-on-success`) |
+| 💀 red | `(Pwn3d!)` — credential grants admin on host |
+| 🧪 green | hashes harvested |
+| 🔓 cyan | cracking activity |
+| 🩸 cyan | DC discovery / BloodHound |
+| ⚡ green | valid credential (live) |
+
+**`--strict`**: exit code 1 if any real error occurred during the run. A final diagnostic block on `stderr` lists up to 20 errors with their context (host, action, reason). Useful in CI / piped scripts:
+
+```bash
+python3 netexec-automator.py -t targets.txt --combo loot.txt --nmap --enum --strict
+echo "exit code: $?"   # 0 = clean, 1 = something needs attention
+```
+
+Warnings and errors go to **stderr**, live findings and the per-host summary stay on **stdout**, so piping behaves predictably:
+
+```bash
+python3 netexec-automator.py … -q 2>/dev/null     # cred lines only, no warnings noise
+python3 netexec-automator.py … 2>errors.log       # capture all warnings/errors separately
+```
+
+The tool also runs a **boot-time validation** of your flag combination — if you enable `--crack` without a hash source (`--secretsdump` / `--enum`), or `--modules` with `--only ldap`, you get a yellow ⚠ explaining why nothing will happen, rather than silent confusion at the end of the run.
+
 ## Combo file format
 
 ```
@@ -387,6 +421,7 @@ Most-used flags at a glance:
 | `--no-cmd-log` | off | Disable the transcript file |
 | `-v, --verbose` | 0 | `-v` commands+errors, `-vv` raw output |
 | `-q, --quiet` | off | Only print valid creds |
+| `--strict` | off | Exit 1 if any real error occurred (CI-friendly) |
 | `-m, --mode` | `combination` | `combination` (cartesian) or `linear` (1-to-1) |
 
 ---

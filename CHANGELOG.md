@@ -10,6 +10,47 @@ no versioned release yet; entries below correspond to commits on `main`).
 
 ## [Unreleased]
 
+### Changed — Error handling polish pass
+- **Action-result classifier**: `_run_nxc_action` now returns a structured
+  `NxcActionResult` instead of bool, and `_classify_action` decides between
+  ✔ (`ok`: produced real data), ⊘ (`noop`: ran cleanly but nothing actionable,
+  e.g. `STATUS_ACCESS_DENIED` or no SAM dump), and ✘ (`fail`: subprocess
+  error). The previous "✔ sam" lie when nxc had exit-0-but-no-data is gone.
+- **Per-action `ok_markers`** in `SMB_ENUM_ACTIONS` / `LDAP_ENUM_ACTIONS` /
+  `SMB_SECRETS_ACTIONS` declare what success *looks like* in the output, so
+  each action's verdict is grounded in actual content.
+- **Status icons standardized** into module-level constants
+  (`ICON_OK / ICON_NOOP / ICON_FAIL / ICON_WARN / ICON_TIMEOUT / ICON_SKIP /
+   ICON_PWN3D / ICON_HARVEST / ICON_CRACK / ICON_BLOODHOUND / ICON_FINDING`)
+  with a single, stable meaning each. Replaces ad-hoc colour+symbol mixes.
+- **`_validate_flag_combinations`** warns at boot when flags can't possibly
+  produce results given the rest of the config (e.g. `--crack` without
+  `--secretsdump`/`--enum`; `--modules` with `--only ldap`).
+- **`HashCracker` captures `stderr`** and exposes `diagnose_zero_cracks()`
+  which converts hashcat error patterns into human-readable hints
+  ("no hashes loaded", "mode unsupported", "wordlist exhausted", "no GPU
+  detected") — replaces the misleading "try a bigger wordlist" suggestion
+  when the real problem was a format mismatch.
+- **`--ntds` skipped on non-DC** hosts via cache-driven `_is_likely_dc`
+  (LDAP open ⇒ likely DC). Shows ⊘ "not a DC" instead of a confusing
+  ⏱ "timed out".
+- **`--strict` flag**: exits with code 1 if any real error occurred during
+  the run. Errors are accumulated in `self.strict_errors` and printed in
+  a final `_print_run_diagnostics()` block (capped at 20 to avoid wall-
+  of-text). Useful for CI / scripted pipelines.
+- **Typed subprocess errors** in `_collect_target_results`: explicit
+  handling for `FileNotFoundError` (binary disappeared mid-run),
+  `PermissionError` (loot dir not writable), `MemoryError` (e.g. huge NTDS
+  output) instead of a generic `Exception` catch-all.
+- **SQLite `timeout=30`s** on the cache connection — no more "database is
+  locked" crashes when two runs of the tool race on the same `state.db`.
+- **BloodHound "no domain cred available" → ⊘ yellow**, not ✘ red (it's
+  expected when only local-auth creds are valid).
+- **Warnings/errors → stderr**, live findings and per-host summary remain
+  on stdout. Piping output through `tee` / `grep` now behaves predictably.
+- 14 new pytest cases (classifier matrix, flag-combo validation, cracker
+  diagnostics, DC heuristic, strict error collection) — 65 total now.
+
 ### Added — Hash cracking
 - **`--crack`** — auto-cracks every hash the post-exploit phase pulls out
   (NT from SAM/LSA/NTDS via `--secretsdump`, AS-REP from `--asreproast`,
