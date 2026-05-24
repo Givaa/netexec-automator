@@ -10,6 +10,25 @@ no versioned release yet; entries below correspond to commits on `main`).
 
 ## [Unreleased]
 
+### Added — Hash cracking
+- **`--crack`** — auto-cracks every hash the post-exploit phase pulls out
+  (NT from SAM/LSA/NTDS via `--secretsdump`, AS-REP from `--asreproast`,
+  TGS-REP from `--kerberoasting`) with `hashcat -m {1000,18200,13100}` or
+  `john --format={nt,krb5asrep,krb5tgs}` as a fallback.
+- **Rockyou auto-discovery** under `/usr/share/wordlists/`,
+  `/usr/share/seclists/...`, `~/wordlists/`, with auto-decompression of
+  `.gz` form on first use. `--wordlist <path>` to override.
+- **Cracked plaintexts auto-appended** to the grow-combo file in
+  `user:password` form → next run sprays the harvested creds without
+  manual editing. This closes the loop: pwn host → dump SAM → crack with
+  rockyou → spray plaintexts across the rest of the network.
+- New CLI: `--crack`, `--wordlist`, `--cracker {hashcat,john,auto}`,
+  `--crack-rules`, `--crack-timeout`. Pre-flight check: missing
+  cracker/wordlist disables the feature gracefully (like `--bloodhound`).
+- `HashCracker` class extracted as standalone for testability (14 new
+  pytest cases: discovery, gz handling, potfile parsing, cmd builder for
+  hashcat/john, kerberos username regex).
+
 ### Added — Tier D (cleanup)
 - `CHANGELOG.md` (this file).
 - `.github/workflows/ci.yml` — runs `pytest` and `bash -n scripts/*.sh` on

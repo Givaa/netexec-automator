@@ -87,6 +87,7 @@ python3 netexec-automator.py -t 10.10.10.0/24 -u x -p x --scan-only
 | **Post-exploit** | `--enum` (shares/users/sessions/loggedon/pass-pol), `--modules X,Y` (nxc `-M`), `--bloodhound` (auto-DC, dedup per domain) |
 | **Reporting** | `commands-*.log` with every command in shell-quoted, copy-pasteable form. Loot tree under `loot/<host>/<proto>/<scope>/` |
 | **Pacing** | `--low-power` preset for weak VMs; `--delay` + `--jitter` for lockout-safe spraying |
+| **Cracking** | `--crack` runs hashcat (or john) on harvested NT (SAM/LSA/NTDS) and Kerberos (AS-REP/TGS-REP) hashes; cracked plaintexts are auto-appended to the grow-combo for the next spray |
 | **Output** | Live `[+]` highlights, per-host summary, `-q` for creds-only, `-v`/`-vv` for full debug |
 
 ---
@@ -100,6 +101,7 @@ Requirements:
 - [NetExec](https://github.com/Pennyw0rth/NetExec) (`nxc` in `PATH`)
 - [nmap](https://nmap.org/) — only for `--nmap` / `--scan-only`
 - [bloodhound-python](https://github.com/dirkjanm/BloodHound.py) (`pip install bloodhound`) — only for `--bloodhound`
+- [hashcat](https://hashcat.net/) (preferred) or [john](https://www.openwall.com/john/) — only for `--crack`; rockyou is auto-discovered under `/usr/share/wordlists/` and friends
 
 The tool itself is a single Python file with **no external dependencies** (stdlib only):
 
@@ -231,6 +233,46 @@ When `--enum`, `--modules`, or `--bloodhound` are on, a follow-up phase runs **p
 3. Run `bloodhound-python -c All --zip` once → `loot/bloodhound/<domain>/<timestamp>/` (zip + stdout/stderr logs).
 4. Persist the successful run in SQLite so the same domain is **never** recollected within `--bloodhound-ttl` (default 24h), even across runs and unrelated credential pairs. `--bloodhound-force` overrides.
 
+### Auto-cracking harvested hashes
+
+When `--crack` is on, every hash the post-exploit phase pulls out gets immediately offered to a cracker (hashcat by default, john as fallback):
+
+| Hash source | nxc flag | Hashcat mode | What lands in loot/ |
+|-------------|----------|--------------|---------------------|
+| SAM / LSA / NTDS | `--sam` / `--lsa` / `--ntds` (via `--secretsdump`) | `-m 1000` (NT) | `loot/cracked/nt-hashes.txt` + cracked plaintexts |
+| AS-REProasting | `--asreproast` (via `--enum`) | `-m 18200` | `loot/<host>/ldap/domain/asreproast.txt` + cracks |
+| Kerberoasting | `--kerberoasting` (via `--enum`) | `-m 13100` | `loot/<host>/ldap/domain/kerberoasting.txt` + cracks |
+
+The wordlist is auto-discovered under:
+1. `/usr/share/wordlists/rockyou.txt` (Kali, decompressed)
+2. `/usr/share/wordlists/rockyou.txt.gz` (Kali, raw — auto-decompressed on first use)
+3. `/usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt`
+4. `~/wordlists/rockyou.txt`
+
+Pass `--wordlist /path/to/file` to override, or download rockyou with:
+```bash
+mkdir -p ~/wordlists
+wget -O ~/wordlists/rockyou.txt \
+    https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt
+```
+
+**The killer move**: every cracked plaintext is appended to the grow-combo file in `user:password` form. Pass that file as `--combo` next run and you're spraying the freshly-cracked accounts across the whole network — lateral movement, automated, end-to-end.
+
+```bash
+# First run — pwn one host, dump SAM, crack with rockyou, append plaintexts to combo
+python3 netexec-automator.py -t 10.10.10.0/24 --combo seed.txt \
+    --nmap --null-session --enum --secretsdump --crack -v
+
+# Second run — spray the harvested+cracked creds across the rest of the network
+python3 netexec-automator.py -t 10.10.10.0/24 \
+    --combo loot/auto-grown-creds.txt --nmap -v
+```
+
+Knobs:
+- `--cracker {hashcat,john,auto}` — pick the cracker (default: auto = hashcat if present)
+- `--crack-rules /usr/share/hashcat/rules/best64.rule` — apply hashcat rules
+- `--crack-timeout 600` — max seconds per attack (default 10 min per hash type)
+
 ### Performance & low-power VMs
 
 If your Kali VM gets crushed by 15 parallel `nxc` subprocesses, use the preset:
@@ -324,6 +366,15 @@ Most-used flags at a glance:
 | `--bloodhound-force` | off | Bypass per-domain dedup |
 | `--bloodhound-ttl` | 86400 | Per-domain dedup window |
 | `--loot-dir` | `loot/` | Root for enum/modules/bloodhound output |
+| `--secretsdump` | off | On `(Pwn3d!)` cred, auto-dump SAM/LSA/NTDS + grow combo |
+| `--grow-combo` | auto | Where to append harvested/cracked creds (default `<loot>/auto-grown-creds.txt`) |
+| `--crack` | off | Auto-crack NT (SAM/LSA/NTDS) + Kerberos (AS-REP/TGS-REP) hashes |
+| `--wordlist` | auto | Wordlist path (default: rockyou auto-discovery) |
+| `--cracker` | `auto` | `hashcat` / `john` / `auto` |
+| `--crack-rules` | — | Hashcat rules file (e.g. `best64.rule`) |
+| `--crack-timeout` | 600 | Per-attack timeout in seconds |
+| `--export-json` | — | Structured run summary in JSON |
+| `--export-csv` | — | Valid creds in CSV format |
 | `--low-power` | off | Preset: 3 workers, retry=1, longer timeouts, small delay |
 | `-w, --workers` | 15 | Parallel threads |
 | `--delay` | 0 | Sleep between credential attempts (seconds) |
