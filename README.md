@@ -107,6 +107,20 @@ cd netexec-automator
 python3 netexec-automator.py --help
 ```
 
+#### Get / update the `nxc` binary
+
+NetExec publishes pre-built standalone binaries (PyInstaller) on its GitHub Releases. The bundled `scripts/update-nxc.sh` will pull the right one for your platform — no `pip`, no Python dependency hell, no sudo required:
+
+```bash
+./scripts/update-nxc.sh                  # detect platform, install to ~/.local/bin/nxc
+./scripts/update-nxc.sh --check          # dry-run: show what would be downloaded
+./scripts/update-nxc.sh --prefix /usr/local/bin   # system-wide install
+./scripts/update-nxc.sh --tag v1.5.0     # pin to a specific release
+./scripts/update-nxc.sh --force          # reinstall even if version matches
+```
+
+The script walks recent releases until it finds one with an asset matching your OS (`nxc-ubuntu-latest.zip` / `nxc-macOS-latest.zip` / `nxc-windows-latest.zip`) — handy when the very latest tag ships no binary. Idempotent: re-running when you're already up-to-date is a no-op. On macOS it also strips the Gatekeeper quarantine attribute so the binary runs on first launch.
+
 ### Air-gapped bundle (offline)
 
 On a build host **with** internet:

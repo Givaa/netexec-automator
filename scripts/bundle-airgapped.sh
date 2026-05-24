@@ -59,17 +59,14 @@ PIP_DOWNLOAD_ARGS=(-d "$WHEELS_DIR" --no-cache-dir)
 "$PYTHON" -m pip download "${PIP_DOWNLOAD_ARGS[@]}" "${PIP_PKGS[@]}" || \
     warn "pip download failed for some packages — bundle may be incomplete"
 
-# NetExec pre-built binary (Linux x64). Optional — script keeps going if unavailable.
+# NetExec pre-built binary. We delegate to scripts/update-nxc.sh which knows how
+# to walk recent releases until it finds one with our platform's zip asset.
 if [ "$SKIP_NXC_BINARY" = "0" ]; then
-    color "fetching NetExec latest binary (Linux x64) from GitHub releases"
-    RELEASE_JSON="$(curl -fsSL https://api.github.com/repos/Pennyw0rth/NetExec/releases/latest || true)"
-    BINARY_URL="$(printf "%s" "$RELEASE_JSON" | \
-        grep -Eio 'https://[^"]+/nxc(-linux[^"]*|_linux[^"]*|-ubuntu[^"]*)?' | head -1 || true)"
-    if [ -n "$BINARY_URL" ]; then
-        curl -fsSL -o "$BIN_DIR/nxc" "$BINARY_URL" && chmod +x "$BIN_DIR/nxc"
-        color "  → bin/nxc (sha256: $(shasum -a 256 "$BIN_DIR/nxc" | awk '{print $1}'))"
+    color "staging NetExec binary via scripts/update-nxc.sh"
+    if PREFIX="$BIN_DIR" CHECK=0 "$HERE/update-nxc.sh" --prefix "$BIN_DIR"; then
+        color "  → bin/nxc (sha256: $(shasum -a 256 "$BIN_DIR/nxc" 2>/dev/null | awk '{print $1}'))"
     else
-        warn "no pre-built nxc binary found in latest release — wheels fallback will be used"
+        warn "could not stage nxc binary (no asset for this build host?) — wheels fallback will be used"
         rmdir "$BIN_DIR" 2>/dev/null || true
     fi
 else

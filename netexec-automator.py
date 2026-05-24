@@ -5,6 +5,7 @@ import os
 import random
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -63,7 +64,25 @@ MAX_RETRY = 3
 SUBPROCESS_TIMEOUT = 45
 NETEXEC_TIMEOUT = 30
 BANNER_WIDTH = 60
-PROGRESS_CLEAR_WIDTH = 70
+# Path-display budget inside the banner before we ellipsize. Keeps long
+# cmd-log / loot-dir / log-file paths from wrapping and trashing the layout.
+BANNER_PATH_BUDGET = 42
+
+
+def _term_width(default: int = 80) -> int:
+    """Return the current terminal width, with a safe fallback for non-TTY."""
+    try:
+        return max(40, shutil.get_terminal_size((default, 24)).columns)
+    except OSError:
+        return default
+
+
+def _truncate_path(p, budget: int = BANNER_PATH_BUDGET) -> str:
+    """Render a path in <budget> chars max — keep the tail (filename) visible."""
+    s = str(p)
+    if len(s) <= budget:
+        return s
+    return "…" + s[-(budget - 1):]
 
 CACHE_DEFAULT_TTL = 86400  # 24h
 CACHE_DEFAULT_PATH = Path.home() / ".cache" / "netexec-automator" / "state.db"
@@ -565,7 +584,7 @@ class NxcAutomator:
         if self.verbosity < level:
             return
         with self.lock:
-            sys.stderr.write("\r" + " " * PROGRESS_CLEAR_WIDTH + "\r")
+            sys.stderr.write("\r" + " " * _term_width() + "\r")
             sys.stderr.flush()
             print(msg, flush=True)
             self._redraw_progress()
@@ -755,7 +774,7 @@ class NxcAutomator:
     def _print_live(self, msg: str):
         """Print a finding in real-time, temporarily clearing the progress bar."""
         with self.lock:
-            sys.stderr.write("\r" + " " * PROGRESS_CLEAR_WIDTH + "\r")
+            sys.stderr.write("\r" + " " * _term_width() + "\r")
             sys.stderr.flush()
             print(msg, flush=True)
             self._redraw_progress()
@@ -1002,11 +1021,11 @@ class NxcAutomator:
         print(f"  Credentials     {DIM}│{RESET} {BOLD}{len(self.credentials):<11}{RESET} Workers   {DIM}│{RESET} {BOLD}{self.workers}{RESET}")
         print(f"  Composition     {DIM}│{RESET} {BOLD}{self._credential_summary()}{RESET}")
         print(f"  Auth Options    {DIM}│{RESET} {BOLD}{self._auth_options_summary()}{RESET}")
-        print(f"  Pairing Mode    {DIM}│{RESET} {BOLD}{self.mode.upper():<11}{RESET} Log File  {DIM}│{RESET} {BOLD}{self.log_file}{RESET}")
+        print(f"  Pairing Mode    {DIM}│{RESET} {BOLD}{self.mode.upper():<11}{RESET} Log File  {DIM}│{RESET} {BOLD}{_truncate_path(self.log_file)}{RESET}")
         print(f"  Nmap Pre-scan   {DIM}│{RESET} {BOLD}{nmap_status:<11}{RESET} Cache     {DIM}│{RESET} {BOLD}{cache_status}{RESET}")
         print(f"  Post-Exploit    {DIM}│{RESET} {BOLD}{self._post_exploit_summary()}{RESET}")
-        print(f"  Verbosity       {DIM}│{RESET} {BOLD}{verbosity_label:<11}{RESET} Loot Dir  {DIM}│{RESET} {BOLD}{self.loot.root}{RESET}")
-        cmd_log_str = str(self.cmd_log_path) if self.cmd_log_path else "disabled"
+        print(f"  Verbosity       {DIM}│{RESET} {BOLD}{verbosity_label:<11}{RESET} Loot Dir  {DIM}│{RESET} {BOLD}{_truncate_path(self.loot.root)}{RESET}")
+        cmd_log_str = _truncate_path(self.cmd_log_path) if self.cmd_log_path else "disabled"
         print(f"  Command Log     {DIM}│{RESET} {BOLD}{cmd_log_str}{RESET}")
         pacing = []
         if self.delay > 0 or self.jitter > 0:
@@ -1187,18 +1206,36 @@ class NxcAutomator:
     def _match_msg_to_credential(self, msg: str, protocol: str) -> "Credential | None":
         """Best-effort: figure out which Credential produced a [+] line.
 
-        nxc prints `domain\\user:secret` (or hash). We match on the longest
-        user/secret pair that appears in the message. Returns None if ambiguous."""
+        nxc prints things like 'corp.local\\admin:Password' or '<user>:<hash>'.
+        We score every candidate cred by how specifically it appears in the
+        message and return the best match — preferring (user matched + secret
+        matched) over (user only) over (secret only). Falls back to the only
+        credential when the spray was single-cred."""
+        msg_lc = msg.lower()
+        best: tuple[int, Credential] | None = None
+
         for cred in self.credentials:
-            secret = cred.nthash or (cred.password or "")
-            user = cred.user
-            # Be lenient: any cred whose user and secret both appear in the msg wins.
-            if user and user in msg and (not secret or secret in msg):
-                return cred
-            if not user and "":
-                # null session — match the literal ":" pattern hard to do; skip
-                pass
-        # Fallback: first credential (works for single-cred runs)
+            user = (cred.user or "").lower()
+            secret = (cred.nthash or cred.password or "")
+            secret_lc = secret.lower()
+
+            user_hit = bool(user) and user in msg_lc
+            # For null-session creds (empty user), look for the tell-tale ':' artifact
+            # that nxc emits, e.g. 'SMB  10.x  445  HOST  [+] \\:' or 'Guest:'.
+            if not user:
+                user_hit = ":" in msg
+            secret_hit = (not secret) or (secret_lc in msg_lc)
+
+            if user_hit and secret_hit:
+                score = 3 if user else 2  # explicit user beats null-session match
+                if best is None or score > best[0]:
+                    best = (score, cred)
+            elif user_hit:
+                if best is None or 1 > best[0]:
+                    best = (1, cred)
+
+        if best:
+            return best[1]
         return self.credentials[0] if len(self.credentials) == 1 else None
 
     def _run_nxc_action(
@@ -1420,11 +1457,16 @@ class NxcAutomator:
                         continue
 
                     results = self._collect_target_results(host, tasks, pair_count)
-                    sys.stderr.write("\r" + " " * PROGRESS_CLEAR_WIDTH + "\r")
+                    # Wipe the progress bar (stderr) before mixing in stdout output;
+                    # also flush stdout so the per-host summary doesn't interleave
+                    # with the next target's progress bar.
+                    sys.stderr.write("\r" + " " * _term_width() + "\r")
                     sys.stderr.flush()
+                    sys.stdout.flush()
 
                     if self.verbosity > V_QUIET:
                         self._print_target_results(results, tasks)
+                        sys.stdout.flush()
 
                     # Post-spray analysis: detect DC, harvest valid creds, run enum/modules
                     self._detect_dc_from_results(host, results, open_ports if self.nmap_enabled else None)
