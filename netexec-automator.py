@@ -3,6 +3,7 @@
 import argparse
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -278,9 +279,11 @@ class HostCache:
 class NmapScanner:
     """Run nmap port discovery and parse XML output."""
 
-    def __init__(self, ports: list[int], timeout: int = NMAP_TIMEOUT):
+    def __init__(self, ports: list[int], timeout: int = NMAP_TIMEOUT, log_cmd=None):
         self.ports = ports
         self.timeout = timeout
+        # Optional callback: (label, cmd, target) → None. Called before each scan.
+        self.log_cmd = log_cmd
 
     @staticmethod
     def is_available() -> bool:
@@ -295,6 +298,8 @@ class NmapScanner:
         Returns {ip_or_hostname: {port: state}} only for hosts with at least one open port."""
         port_arg = ",".join(str(p) for p in self.ports)
         cmd = ["nmap", "-Pn", "-n", "--open", "-p", port_arg, "-T4", "-oX", "-", target]
+        if self.log_cmd:
+            self.log_cmd("nmap", cmd, target)
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
         except subprocess.TimeoutExpired:
@@ -356,12 +361,15 @@ class BloodHoundRunner:
         ttl: int = CACHE_DEFAULT_TTL,
         force: bool = False,
         timeout: int = BLOODHOUND_TIMEOUT,
+        log_cmd=None,
     ):
         self.cache = cache
         self.loot = loot
         self.ttl = ttl
         self.force = force
         self.timeout = timeout
+        # Optional callback: (label, cmd, target) → None
+        self.log_cmd = log_cmd
 
     @staticmethod
     def is_available() -> bool:
@@ -403,6 +411,8 @@ class BloodHoundRunner:
             "bloodhound", LootStore.safe_name(domain), ts
         )
         cmd = self.build_cmd(domain, dc_ip, credential)
+        if self.log_cmd:
+            self.log_cmd(f"bloodhound {domain}", cmd, dc_ip)
         last_err = ""
         success = False
         try:
@@ -456,6 +466,8 @@ class NxcAutomator:
         bloodhound_force: bool = False,
         bloodhound_ttl: int = CACHE_DEFAULT_TTL,
         loot_dir: str = "loot",
+        cmd_log: str | None = None,
+        cmd_log_disabled: bool = False,
     ):
         self.targets = self._read_value_or_file(target)
         self.mode = mode.lower()
@@ -477,14 +489,24 @@ class NxcAutomator:
 
         self.workers = workers
         self.lock = Lock()
+        self.cmd_log_lock = Lock()
         self.completed = 0
         self.total_tasks = 0
-        self.log_file = output if output else datetime.now().strftime("%H-%M-%S-%f")[:-3] + ".txt"
+        ts = datetime.now().strftime("%H-%M-%S-%f")[:-3]
+        self.log_file = output if output else f"{ts}.txt"
+        if cmd_log_disabled:
+            self.cmd_log_path: Path | None = None
+        else:
+            self.cmd_log_path = Path(cmd_log) if cmd_log else Path(f"commands-{ts}.log")
+        self._cmd_log_initialized = False
 
         self.verbosity = verbosity
         self.nmap_enabled = nmap_enabled
         self.scan_only = scan_only
-        self.scanner = NmapScanner(ports=self._all_known_ports()) if nmap_enabled else None
+        self.scanner = (
+            NmapScanner(ports=self._all_known_ports(), log_cmd=self._log_command)
+            if nmap_enabled else None
+        )
         # Cache is also useful for DC/bloodhound dedup even without --nmap.
         cache_useful = (nmap_enabled or bloodhound_enabled) and cache_enabled
         self.cache = HostCache(CACHE_DEFAULT_PATH, ttl=cache_ttl) if cache_useful else None
@@ -494,7 +516,11 @@ class NxcAutomator:
         self.loot = LootStore(Path(loot_dir))
         self.bloodhound_enabled = bloodhound_enabled
         self.bloodhound_runner = (
-            BloodHoundRunner(self.cache, self.loot, ttl=bloodhound_ttl, force=bloodhound_force)
+            BloodHoundRunner(
+                self.cache, self.loot,
+                ttl=bloodhound_ttl, force=bloodhound_force,
+                log_cmd=self._log_command,
+            )
             if bloodhound_enabled else None
         )
 
@@ -524,7 +550,31 @@ class NxcAutomator:
 
     def _vprint_cmd(self, label: str, cmd: list[str]):
         """Verbose: dump the command line about to be executed."""
-        self._vprint(V_VERBOSE, f"  {DIM}$ [{label}] {' '.join(cmd)}{RESET}")
+        self._vprint(V_VERBOSE, f"  {DIM}$ [{label}] {shlex.join(cmd)}{RESET}")
+
+    def _log_command(self, label: str, cmd: list[str], target: str | None = None):
+        """Append a shell-pasteable copy of cmd to commands.log AND emit verbose dump.
+
+        Format is OSCP-report friendly: comment header with timestamp + label,
+        followed by the exact command (shell-quoted), one entry per call."""
+        self._vprint_cmd(label, cmd)
+        if not self.cmd_log_path:
+            return
+        with self.cmd_log_lock:
+            mode = "a" if self._cmd_log_initialized else "w"
+            with open(self.cmd_log_path, mode) as fh:
+                if not self._cmd_log_initialized:
+                    fh.write(
+                        "# NetExec Automator — commands transcript\n"
+                        f"# Started: {datetime.now().isoformat(timespec='seconds')}\n"
+                        "# Each block: '# <iso ts> [label] target=<host>' followed by\n"
+                        "# the exact shell-quoted command. Safe to copy-paste into reports.\n\n"
+                    )
+                    self._cmd_log_initialized = True
+                ts_iso = datetime.now().isoformat(timespec="seconds")
+                tgt = f" target={target}" if target else ""
+                fh.write(f"# {ts_iso} [{label}]{tgt}\n")
+                fh.write(shlex.join(cmd) + "\n\n")
 
     @staticmethod
     def _read_lines(path: str) -> list[str]:
@@ -804,7 +854,7 @@ class NxcAutomator:
                 self._update_progress()
                 continue
             cmd = self._build_nxc_command(protocol, target, credential, local_auth)
-            self._vprint_cmd(self._task_label(protocol, local_auth), cmd)
+            self._log_command(self._task_label(protocol, local_auth), cmd, target=target)
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
                 stdout = (result.stdout or "").strip()
@@ -924,6 +974,8 @@ class NxcAutomator:
         print(f"  Nmap Pre-scan   {DIM}│{RESET} {BOLD}{nmap_status:<11}{RESET} Cache     {DIM}│{RESET} {BOLD}{cache_status}{RESET}")
         print(f"  Post-Exploit    {DIM}│{RESET} {BOLD}{self._post_exploit_summary()}{RESET}")
         print(f"  Verbosity       {DIM}│{RESET} {BOLD}{verbosity_label:<11}{RESET} Loot Dir  {DIM}│{RESET} {BOLD}{self.loot.root}{RESET}")
+        cmd_log_str = str(self.cmd_log_path) if self.cmd_log_path else "disabled"
+        print(f"  Command Log     {DIM}│{RESET} {BOLD}{cmd_log_str}{RESET}")
         if self.scan_only:
             print(f"  {YELLOW}{BOLD}⚠ scan-only mode — no auth attempts will run{RESET}")
         else:
@@ -1124,7 +1176,7 @@ class NxcAutomator:
             i = cmd.index("--log")
             del cmd[i : i + 2]
         cmd.extend(extra_args)
-        self._vprint_cmd("post-ex", cmd)
+        self._log_command(f"post-ex {' '.join(extra_args)}".strip(), cmd, target=host)
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
             loot_path.write_text((result.stdout or "") + ("\n--- stderr ---\n" + result.stderr if result.stderr else ""))
@@ -1434,6 +1486,14 @@ def parse_args():
         "--loot-dir", default="loot",
         help="Directory root for enum/modules/bloodhound output (default: loot/).",
     )
+    parser.add_argument(
+        "--cmd-log",
+        help="Path for the shell-quoted commands transcript (default: commands-HH-MM-SS-mmm.log).",
+    )
+    parser.add_argument(
+        "--no-cmd-log", action="store_true",
+        help="Disable the commands transcript file.",
+    )
     return parser.parse_args()
 
 
@@ -1468,6 +1528,8 @@ def main():
             bloodhound_force=args.bloodhound_force,
             bloodhound_ttl=args.bloodhound_ttl,
             loot_dir=args.loot_dir,
+            cmd_log=args.cmd_log,
+            cmd_log_disabled=args.no_cmd_log,
         )
         runner.run()
     except ValueError as exc:

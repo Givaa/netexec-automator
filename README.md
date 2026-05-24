@@ -45,6 +45,7 @@ python3 netexec-automator.py -t targets.txt -u users.txt -p passwords.txt
 - **Auto-BloodHound (`--bloodhound`)** — Detects the AD domain from nxc's SMB banner, identifies a DC (LDAP+SMB open or banner-advertised), and invokes `bloodhound-python -c All --zip` once per discovered domain. Output lands in `loot/bloodhound/<domain>/<timestamp>/`.
 - **BloodHound dedup** — Persisted to SQLite. The same domain isn't recollected within `--bloodhound-ttl` (default 24h), even across runs and unrelated credential pairs. `--bloodhound-force` to override.
 - **Verbosity controls (`-v`/`-vv`/`-q`)** — From silent (only valid creds) to full debug (raw nxc/nmap output, cache hit/miss, per-attempt command dump).
+- **Commands transcript (`commands-*.log`)** — Every command launched (nxc auth, nxc post-exploit, nmap, bloodhound-python) is appended to a timestamped log in **shell-quoted, copy-paste-ready** form. Perfect for OSCP-style reports — open the file, grab the line, paste into the writeup. Disable with `--no-cmd-log`.
 
 ## Requirements
 
@@ -124,6 +125,8 @@ python3 netexec-automator.py -t targets.txt --combo loot.txt --nmap -q
 | `--bloodhound-force` | Bypass the per-domain dedup cache and re-run BloodHound | `off` |
 | `--bloodhound-ttl` | Dedup window for BloodHound runs per domain (seconds) | `86400` (24h) |
 | `--loot-dir` | Root directory for enum/modules/bloodhound output | `loot/` |
+| `--cmd-log` | Path for the shell-quoted commands transcript | `commands-HH-MM-SS-mmm.log` |
+| `--no-cmd-log` | Disable the commands transcript file | `off` |
 
 ### Credential sources — accepted combinations
 
@@ -279,6 +282,32 @@ python3 netexec-automator.py -t 10.10.10.0/24 --combo new_loot.txt --nmap --bloo
 # Force re-collection (e.g. after major AD changes)
 python3 netexec-automator.py -t 10.10.10.0/24 --combo new_loot.txt --nmap --bloodhound --bloodhound-force
 ```
+
+## Commands Transcript (OSCP-friendly)
+
+Every command the tool fires — nmap port discovery, each nxc auth attempt, post-exploit `--shares`/`--users`/etc., nxc `-M` modules, and `bloodhound-python` — is appended to a timestamped log in **shell-pasteable form** (passwords with spaces, backticks, `$`, quotes, and backslashes in usernames are all correctly quoted with `shlex`).
+
+```
+# NetExec Automator — commands transcript
+# Started: 2026-05-24T15:43:35
+
+# 2026-05-24T15:43:35 [nmap] target=10.10.10.0/24
+nmap -Pn -n --open -p 445,139,22,389,636,21,135,5985,5986,3389,5900,1433,2049 -T4 -oX - 10.10.10.0/24
+
+# 2026-05-24T15:43:48 [SMB (domain)] target=10.10.10.5
+nxc smb 10.10.10.5 -u 'dom\admin' -p 'P@ss w0rd '"'"'$x`' -d corp.local --timeout 30 --log 15-43-35-713.txt
+
+# 2026-05-24T15:43:51 [SMB (domain)] target=10.10.10.5
+nxc smb 10.10.10.5 -u svc -H 8846f7eaee8fb117ad06bdd830b7586c -d corp.local --timeout 30 --log 15-43-35-713.txt
+
+# 2026-05-24T15:44:02 [post-ex --shares] target=10.10.10.5
+nxc smb 10.10.10.5 -u 'dom\admin' -p 'P@ss w0rd '"'"'$x`' -d corp.local --timeout 30 --shares
+
+# 2026-05-24T15:44:18 [bloodhound corp.local] target=10.10.10.5
+bloodhound-python -c All -u 'dom\admin' -d corp.local -dc 10.10.10.5 -ns 10.10.10.5 --zip -p 'P@ss w0rd '"'"'$x`'
+```
+
+Default filename: `commands-HH-MM-SS-mmm.log` in the cwd. Override with `--cmd-log /path/to/file`, suppress with `--no-cmd-log`.
 
 ## Verbosity
 
