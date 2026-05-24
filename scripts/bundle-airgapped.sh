@@ -2,7 +2,7 @@
 # Build a self-contained bundle for air-gapped deployment.
 #
 # Output: dist/netexec-automator-airgapped-<YYYYMMDD>.tar.gz containing:
-#   - netexec-automator.py + README + LICENSE
+#   - netexec-automator.py + netexec_automator/ + scripts/ + README + LICENSE
 #   - wheels/        Python wheels for netexec + bloodhound (+ all transitive deps)
 #   - bin/nxc        (optional) latest pre-built NetExec linux-x64 binary from GitHub
 #   - install-offline.sh    one-shot installer for the target host
@@ -47,9 +47,11 @@ rm -rf "$STAGING"
 mkdir -p "$WHEELS_DIR" "$BIN_DIR"
 
 color "copying tool sources"
-cp "$ROOT/netexec-automator.py" "$STAGING/"
-cp "$ROOT/README.md"            "$STAGING/"
-cp "$ROOT/LICENSE"              "$STAGING/"
+cp    "$ROOT/netexec-automator.py" "$STAGING/"
+cp    "$ROOT/README.md"            "$STAGING/"
+cp    "$ROOT/LICENSE"              "$STAGING/"
+cp -R "$ROOT/netexec_automator"    "$STAGING/"
+cp -R "$ROOT/scripts"              "$STAGING/"
 
 color "downloading Python wheels for netexec$( [ "$INCLUDE_BLOODHOUND" = "1" ] && echo " + bloodhound" )"
 PIP_PKGS=("netexec")
@@ -107,7 +109,8 @@ fi
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/share/netexec-automator}"
 mkdir -p "$INSTALL_DIR"
-cp "$HERE/netexec-automator.py" "$INSTALL_DIR/"
+cp    "$HERE/netexec-automator.py" "$INSTALL_DIR/"
+cp -R "$HERE/netexec_automator"    "$INSTALL_DIR/"
 chmod +x "$INSTALL_DIR/netexec-automator.py"
 ln -sf "$INSTALL_DIR/netexec-automator.py" "$VENV_DIR/bin/netexec-automator"
 

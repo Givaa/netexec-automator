@@ -37,7 +37,8 @@ RUN pip install --no-cache-dir netexec \
 # The tool itself is pure stdlib — just drop it in PATH.
 WORKDIR /opt/netexec-automator
 COPY netexec-automator.py /opt/netexec-automator/netexec-automator.py
-COPY README.md /opt/netexec-automator/README.md
+COPY netexec_automator    /opt/netexec-automator/netexec_automator
+COPY README.md            /opt/netexec-automator/README.md
 RUN chmod +x /opt/netexec-automator/netexec-automator.py \
  && ln -s /opt/netexec-automator/netexec-automator.py /usr/local/bin/netexec-automator
 

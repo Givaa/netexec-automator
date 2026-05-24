@@ -1,23 +1,20 @@
-"""Load the single-file tool as a module so tests can import it.
+"""Load the netexec_automator package so tests can import it as `nxa`.
 
-The tool ships as `netexec-automator.py` (with a dash, no package).
-importlib lets us pull it in as `nxa` without renaming or restructuring."""
+The package's __init__.py re-exports everything top-level so the test
+files don't need to know about the internal module layout (they continue
+to use nxa.NxcAutomator / nxa.HASH_DUMP_LINE_RE / nxa._truncate_path /
+nxa.NmapScanner._parse_xml exactly as before)."""
 
-import importlib.util
 import sys
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 
 @pytest.fixture(scope="session")
 def nxa():
-    spec = importlib.util.spec_from_file_location(
-        "nxa", REPO_ROOT / "netexec-automator.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["nxa"] = mod
-    spec.loader.exec_module(mod)
+    import netexec_automator as mod
     return mod
