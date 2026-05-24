@@ -394,6 +394,7 @@ Most-used flags at a glance:
 | `--scan-only` | off | Pre-scan only, no auth attempts |
 | `--no-cache` | off | Bypass SQLite cache |
 | `--cache-ttl` | 86400 | Nmap cache validity in seconds |
+| `--cache-path` | `~/.cache/...` | Custom SQLite cache path (isolate parallel/CI runs) |
 | `--enum` | off | SMB enum probes into `loot/` |
 | `--modules` | — | Comma-separated nxc `-M` modules |
 | `--bloodhound` | off | Auto-collect BloodHound per discovered domain |

@@ -679,7 +679,15 @@ class HashCracker:
 
     def crack(self, hash_type: str, hash_file: Path) -> tuple[bool, list[tuple[str, str]]]:
         """Run the cracker for one hash file. Returns (success, [(hash,plain)…]).
-        Last stderr is stashed on self for the caller to surface user-facing hints."""
+
+        Hashcat occasionally segfaults / gets OOM-killed mid-run, especially
+        when the GPU driver is unhappy or the workload profile is too high.
+        We detect that (returncode < 0 = killed by signal) and retry once
+        with `-w 1` (low workload). The potfile is write-as-you-go so any
+        plaintexts cracked before the crash are preserved across attempts.
+
+        last_stderr is always populated for the caller to feed to
+        diagnose_zero_cracks()."""
         self.last_stderr = ""
         cracker = self.cracker()
         if not cracker:
@@ -690,18 +698,33 @@ class HashCracker:
         if not hash_file.exists() or hash_file.stat().st_size == 0:
             return False, []
 
-        cmd = self.build_cmd(hash_type, hash_file, wordlist)
-        if self.log_cmd:
-            self.log_cmd(f"crack {hash_type}", cmd, str(hash_file))
+        base_cmd = self.build_cmd(hash_type, hash_file, wordlist)
 
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
-            self.last_stderr = (res.stderr or "").strip()
-        except subprocess.TimeoutExpired:
-            self.last_stderr = "timed out"
-        except FileNotFoundError as exc:
-            self.last_stderr = f"{exc.filename} not found"
-            return False, []
+        for attempt in range(2):  # 0 = first try, 1 = retry with -w 1
+            cmd = base_cmd if attempt == 0 else (base_cmd + ["-w", "1"])
+            if self.log_cmd:
+                label = f"crack {hash_type}" + (f" retry-w1" if attempt else "")
+                self.log_cmd(label, cmd, str(hash_file))
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
+                self.last_stderr = (res.stderr or "").strip()
+                if res.returncode >= 0:
+                    # Normal termination (0 = cracks, 1 = no cracks for hashcat — both ok).
+                    break
+                # Negative returncode = killed by signal (SIGSEGV, SIGKILL via OOM-killer, …)
+                self.last_stderr = (
+                    f"{cracker} killed by signal {-res.returncode} "
+                    f"(attempt {attempt + 1}/2)\n{self.last_stderr}"
+                ).strip()
+                if attempt == 0 and cracker == "hashcat":
+                    continue  # retry with -w 1
+                break
+            except subprocess.TimeoutExpired:
+                self.last_stderr = "timed out"
+                break
+            except FileNotFoundError as exc:
+                self.last_stderr = f"{exc.filename} not found"
+                return False, []
 
         cracked = self._collect_results(cracker, hash_type, hash_file)
         return True, cracked
@@ -712,6 +735,12 @@ class HashCracker:
         s = (self.last_stderr or "").lower()
         if not s:
             return None
+        if "killed by signal 9" in s or "out of memory" in s or "killed (signal: 9)" in s:
+            return "hashcat killed by OOM — wordlist too large for available RAM, try a smaller list"
+        if "killed by signal 11" in s or "segmentation fault" in s or "segfault" in s:
+            return "hashcat segfaulted (GPU driver?) — retried with -w 1 already; falling back to john may help"
+        if "killed by signal" in s:
+            return "hashcat killed by a signal — see commands.log + system dmesg for details"
         if "no hashes loaded" in s:
             return "no hashes loaded — invalid hash format for this -m mode?"
         if "hash-mode" in s and ("not supported" in s or "unknown" in s):
@@ -792,6 +821,7 @@ class NxcAutomator:
         nmap_enabled: bool = False,
         cache_enabled: bool = True,
         cache_ttl: int = CACHE_DEFAULT_TTL,
+        cache_path: str | None = None,
         scan_only: bool = False,
         verbosity: int = V_NORMAL,
         enum_enabled: bool = False,
@@ -869,7 +899,8 @@ class NxcAutomator:
         )
         # Cache is also useful for DC/bloodhound dedup even without --nmap.
         cache_useful = (nmap_enabled or bloodhound_enabled) and cache_enabled
-        self.cache = HostCache(CACHE_DEFAULT_PATH, ttl=cache_ttl) if cache_useful else None
+        resolved_cache_path = Path(cache_path).expanduser() if cache_path else CACHE_DEFAULT_PATH
+        self.cache = HostCache(resolved_cache_path, ttl=cache_ttl) if cache_useful else None
 
         self.enum_enabled = enum_enabled
         self.modules = [m.strip() for m in modules.split(",") if m.strip()] if modules else []
@@ -1665,6 +1696,11 @@ class NxcAutomator:
             return best[1]
         return self.credentials[0] if len(self.credentials) == 1 else None
 
+    # Cap for the classifier read-back. nxc's [+]/[-]/info markers always
+    # appear early in the output (banner + first auth line) so 64 KB is
+    # plenty even for NTDS dumps that may run to hundreds of MB.
+    LOOT_HEAD_BYTES = 64 * 1024
+
     def _run_nxc_action(
         self,
         protocol: str,
@@ -1674,7 +1710,12 @@ class NxcAutomator:
         extra_args: list[str],
         loot_path: Path,
     ) -> NxcActionResult:
-        """Run a follow-up nxc command (--shares, --users, -M ...) and persist output."""
+        """Run a follow-up nxc command and persist its output.
+
+        Streams stdout straight to the loot file instead of buffering in RAM —
+        critical for `--ntds` on real DCs where the dump can be hundreds of MB
+        and `capture_output=True` would OOM. stderr stays in memory (always
+        small) and is appended to the loot file after the run."""
         cmd = self._build_nxc_command(protocol, host, credential, local_auth)
         # Drop the --log clause: post-exploit output should live in loot/, not the main run log.
         if "--log" in cmd:
@@ -1682,18 +1723,40 @@ class NxcAutomator:
             del cmd[i : i + 2]
         cmd.extend(extra_args)
         self._log_command(f"post-ex {' '.join(extra_args)}".strip(), cmd, target=host)
+
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=self.subprocess_timeout)
-            stdout = result.stdout or ""
-            stderr = result.stderr or ""
+            loot_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._record_error(f"cannot create loot dir {loot_path.parent}: {exc}")
+            return NxcActionResult(ok=False, exit_code=13, stdout="", stderr=str(exc), loot_path=loot_path)
+
+        try:
+            with open(loot_path, "wb") as out_fh:
+                proc = subprocess.run(
+                    cmd,
+                    stdout=out_fh,
+                    stderr=subprocess.PIPE,
+                    timeout=self.subprocess_timeout,
+                )
+            stderr_text = (proc.stderr.decode("utf-8", errors="replace") if proc.stderr else "").strip()
+            if stderr_text:
+                try:
+                    with open(loot_path, "ab") as fh:
+                        fh.write(b"\n--- stderr ---\n")
+                        fh.write(stderr_text.encode("utf-8", errors="replace"))
+                except OSError:
+                    pass
+            # Read only the head for the classifier — markers are always near the top.
+            head = ""
             try:
-                loot_path.write_text(stdout + ("\n--- stderr ---\n" + stderr if stderr else ""))
-            except OSError as exc:
-                self._record_error(f"cannot write loot {loot_path}: {exc}")
+                with open(loot_path, "rb") as fh:
+                    head = fh.read(self.LOOT_HEAD_BYTES).decode("utf-8", errors="replace")
+            except OSError:
+                pass
             return NxcActionResult(
-                ok=(result.returncode == 0),
-                exit_code=result.returncode,
-                stdout=stdout, stderr=stderr, loot_path=loot_path,
+                ok=(proc.returncode == 0),
+                exit_code=proc.returncode,
+                stdout=head, stderr=stderr_text, loot_path=loot_path,
             )
         except subprocess.TimeoutExpired:
             try:
@@ -1702,9 +1765,15 @@ class NxcAutomator:
                 pass
             return NxcActionResult(ok=False, exit_code=-1, stdout="", stderr="timed out", loot_path=loot_path)
         except FileNotFoundError as exc:
-            # nxc disappeared mid-run — rare but worth surfacing distinctly.
             self._record_error(f"nxc not found mid-run: {exc.filename}")
             return NxcActionResult(ok=False, exit_code=127, stdout="", stderr=str(exc), loot_path=loot_path)
+        except PermissionError as exc:
+            self._record_error(f"cannot write loot {loot_path}: {exc}")
+            return NxcActionResult(ok=False, exit_code=13, stdout="", stderr=str(exc), loot_path=loot_path)
+        except OSError as exc:
+            # Disk full or similar mid-stream; we still want to keep going.
+            self._record_error(f"I/O error writing {loot_path}: {exc}")
+            return NxcActionResult(ok=False, exit_code=5, stdout="", stderr=str(exc), loot_path=loot_path)
 
     @staticmethod
     def _classify_action(result: NxcActionResult, ok_markers: list[str], extra_text: str = "") -> tuple[str, str, str]:
@@ -2531,6 +2600,9 @@ def _build_parser():
                         help="Bypass the SQLite nmap-result cache.")
     g_scan.add_argument("--cache-ttl", type=int, default=CACHE_DEFAULT_TTL,
                         help=f"Cache TTL for nmap results in seconds (default: {CACHE_DEFAULT_TTL} = 24h).")
+    g_scan.add_argument("--cache-path",
+                        help=f"Custom SQLite cache path (default: {CACHE_DEFAULT_PATH}). Use this to "
+                             "isolate concurrent / CI runs from each other.")
 
     # ----- Post-exploitation -----
     g_post = parser.add_argument_group("post-exploitation (runs only on valid creds)")
@@ -2699,6 +2771,7 @@ def main():
             nmap_enabled=nmap_enabled,
             cache_enabled=not args.no_cache,
             cache_ttl=args.cache_ttl,
+            cache_path=args.cache_path,
             scan_only=args.scan_only,
             verbosity=verbosity,
             enum_enabled=args.enum,

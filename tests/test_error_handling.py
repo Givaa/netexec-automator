@@ -117,3 +117,77 @@ def test_diagnose_zero_cracks_returns_none_on_empty(nxa, tmp_path):
     cracker = nxa.HashCracker(loot=loot)
     cracker.last_stderr = ""
     assert cracker.diagnose_zero_cracks() is None
+
+
+def test_diagnose_zero_cracks_segfault(nxa, tmp_path):
+    loot = nxa.LootStore(tmp_path / "loot")
+    cracker = nxa.HashCracker(loot=loot)
+    cracker.last_stderr = "hashcat killed by signal 11 (attempt 2/2)"
+    hint = cracker.diagnose_zero_cracks()
+    assert hint and "segfault" in hint.lower()
+
+
+def test_diagnose_zero_cracks_oom(nxa, tmp_path):
+    loot = nxa.LootStore(tmp_path / "loot")
+    cracker = nxa.HashCracker(loot=loot)
+    cracker.last_stderr = "hashcat killed by signal 9"
+    hint = cracker.diagnose_zero_cracks()
+    assert hint and "oom" in hint.lower()
+
+
+def test_cache_path_custom(nxa, tmp_path):
+    """--cache-path lets the user isolate parallel runs on a custom DB."""
+    custom = tmp_path / "isolated.db"
+    a = nxa.NxcAutomator(
+        target="x", user="u", password="p",
+        nmap_enabled=True, cache_path=str(custom),
+    )
+    assert a.cache is not None
+    assert a.cache.path == custom
+    assert custom.exists()
+    a.cache.close()
+
+
+def test_streaming_nxc_action_no_capture_output(nxa, tmp_path, monkeypatch):
+    """Streaming refactor: stdout goes straight to the loot file, not RAM."""
+    import subprocess as sp
+    a = nxa.NxcAutomator(target="x", user="u", password="p", loot_dir=str(tmp_path / "loot"))
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        # Verify we are NOT using capture_output (memory-killing for big dumps).
+        assert "capture_output" not in kwargs, "must stream stdout to file, not buffer"
+        assert kwargs.get("stdout") is not None, "stdout must be a file handle"
+        # Write fake nxc output to the streamed file
+        kwargs["stdout"].write(b"SMB  10.0.0.1  445  HOST  Sharename     Permissions  Remark\n"
+                                b"ADMIN$  READ\n")
+        captured["cmd"] = cmd
+        return sp.CompletedProcess(cmd, returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(sp, "run", fake_run)
+    loot_path = tmp_path / "test-out.txt"
+    result = a._run_nxc_action(
+        "smb", "10.0.0.1", a.credentials[0], local_auth=False,
+        extra_args=["--shares"], loot_path=loot_path,
+    )
+    assert result.ok
+    assert "Sharename" in result.stdout  # head read back from file
+    assert loot_path.exists() and loot_path.stat().st_size > 0
+    # The head should also be re-readable for the classifier
+    status, _, _ = nxa.NxcAutomator._classify_action(result, ["Sharename"])
+    assert status == "ok"
+
+
+def test_streaming_nxc_action_permission_error(nxa, tmp_path):
+    """If loot dir can't be created, we record an error and return a fail result."""
+    # Point loot at an unwriteable parent (file masquerading as dir)
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("I am a file")
+    a = nxa.NxcAutomator(target="x", user="u", password="p", loot_dir=str(blocker))
+    loot_path = blocker / "sub" / "out.txt"
+    result = a._run_nxc_action(
+        "smb", "10.0.0.1", a.credentials[0], local_auth=False,
+        extra_args=["--shares"], loot_path=loot_path,
+    )
+    assert not result.ok
+    assert a.strict_errors  # error was recorded

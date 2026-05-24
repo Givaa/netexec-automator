@@ -10,6 +10,27 @@ no versioned release yet; entries below correspond to commits on `main`).
 
 ## [Unreleased]
 
+### Changed — Robustness (post-polish gaps)
+- **Streaming post-exploit output to disk** (`_run_nxc_action`): stdout now
+  goes straight to the loot file via `subprocess.run(stdout=fh)` instead of
+  `capture_output=True` (which buffered the full output in RAM). This kills
+  the OOM-when-dumping-NTDS-on-a-real-DC class of failures — multi-hundred-MB
+  dumps now stream cleanly regardless of available memory. Only the first
+  64 KB are read back for the classifier (markers are always near the top).
+  Added `PermissionError` / `OSError` (disk full) handling on the loot write.
+- **`--cache-path <file>`**: custom SQLite cache location, so parallel /
+  CI runs of the tool don't fight over the same `~/.cache/.../state.db`.
+- **HashCracker retries on signal-kill**: when hashcat returns a negative
+  exit code (SIGSEGV, OOM-killer), we automatically retry once with
+  `-w 1` (lowest workload profile). The potfile is write-as-you-go so any
+  plaintexts cracked before the crash are preserved across the retry.
+- **`diagnose_zero_cracks` learns new patterns**: distinguishes OOM-kill
+  (signal 9), segfault (signal 11), and generic signal kills, and emits
+  actionable hints instead of the previous "try a bigger wordlist".
+- 5 new pytest cases (segfault hint, OOM hint, --cache-path isolation,
+  streaming-not-buffering subprocess kwargs, permission error on loot dir)
+  — 70 total now.
+
 ### Changed — Error handling polish pass
 - **Action-result classifier**: `_run_nxc_action` now returns a structured
   `NxcActionResult` instead of bool, and `_classify_action` decides between
