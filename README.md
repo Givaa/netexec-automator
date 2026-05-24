@@ -1,223 +1,185 @@
 # NetExec Automator
 
-**NetExec Automator** takes your targets, users, and passwords (single values or files) and blasts them across all 10 nxc protocols in parallel — with local auth variants included. Choose between **combination** (all user×password pairs) or **linear** (index-matched pairs) credential pairing. You get live hits as they come in, automatic timeout skipping, and a clean summary at the end.
+> Spray [NetExec](https://github.com/Pennyw0rth/NetExec) across **all 10 protocols** in parallel — with nmap pre-scan, hash & Kerberos auth, auto-enum, BloodHound collection, and a shell-pasteable commands transcript for your report.
 
 ![NetExec Automator Demo](assets/netexec-automator-demo.gif)
 
-**Workflow: find creds → add to lists → re-scan → repeat.**
-
 ```bash
-# Initial scan with known creds (combination mode — all user×password pairs)
-python3 netexec-automator.py -t targets.txt -u users.txt -p passwords.txt
-
-# Found svc_backup:Summer2025! in a config file? Add it and re-scan
-echo 'svc_backup' >> users.txt
-echo 'Summer2025!' >> passwords.txt
-python3 netexec-automator.py -t targets.txt -u users.txt -p passwords.txt
-
-# Have known user:password pairs? Use linear mode (1-to-1 index matching)
-python3 netexec-automator.py -t targets.txt -u users.txt -p passwords.txt -m linear
-
-# Got a new subnet? Add those targets and go again
-echo '10.10.20.0/24' >> targets.txt
-python3 netexec-automator.py -t targets.txt -u users.txt -p passwords.txt
+# The fastest possible "do everything" command on an internal network
+python3 netexec-automator.py -t 10.10.10.0/24 --combo loot.txt \
+    --nmap --null-session --enum --bloodhound -v
 ```
 
-## Features
+---
 
-- **10 protocols** — SMB, SSH, LDAP, FTP, WMI, WinRM, RDP, VNC, MSSQL, NFS
-- **Local auth variants** — Automatically tests `--local-auth` for SMB, WMI, WinRM, RDP, MSSQL
-- **Credential pairing modes** — `combination` (cartesian product, default) or `linear` (index-matched 1-to-1 pairs)
-- **Parallel execution** — 15 concurrent workers by default (one per protocol/auth-type)
-- **Live findings** — Valid credentials (`⚡`) and timeout skips (`⏱`) printed in real-time
-- **Auto-skip** — Protocols with consecutive connectivity timeouts are skipped to save time
-- **Clean output** — Parsed nxc output, grouped by protocol, with a final credential summary
-- **Progress bar** — Real-time tracking per individual nxc command
-- **File input** — Accepts single values or newline-separated files for targets, users, and passwords
-- **Nmap pre-scan (opt-in)** — `--nmap` discovers open ports first and only sprays protocols whose ports are actually open. Massive speedup on wide CIDRs and dead hosts.
-- **SQLite cache** — Pre-scan results are cached in `~/.cache/netexec-automator/state.db` with configurable TTL (default 24h), so repeat runs are instant.
-- **NTLM hash auth (`-H`)** — Pass-the-hash with NT or LM:NT format. Accepts single hash or file. Auto-skipped on protocols that don't support it (SSH/FTP/VNC/NFS).
-- **Combo files (`--combo`)** — Single `user:secret` file with per-line auto-detection: passwords, NT hashes, and LM:NT hashes mixed freely. Comments (`#`) and blank lines supported.
-- **Domain auth (`-d`)** — Explicit domain flag, automatically suppressed on `--local-auth` runs.
-- **Kerberos (`-k`)** — Use existing ccache (`KRB5CCNAME`) for ticket-based auth on SMB/LDAP/WMI/WinRM/MSSQL.
-- **Null session + Guest + anonymous (`--null-session`)** — Tries `""`/`Guest`/`anonymous` with empty passwords as cheap quick-wins before the main spray.
-- **Auto post-exploitation (`--enum`, `--modules`)** — On any valid SMB cred, runs `--shares`/`--users`/`--sessions`/`--loggedon-users`/`--pass-pol` and any nxc `-M` modules, saving output under `loot/<host>/smb/<scope>/`.
-- **Auto-BloodHound (`--bloodhound`)** — Detects the AD domain from nxc's SMB banner, identifies a DC (LDAP+SMB open or banner-advertised), and invokes `bloodhound-python -c All --zip` once per discovered domain. Output lands in `loot/bloodhound/<domain>/<timestamp>/`.
-- **BloodHound dedup** — Persisted to SQLite. The same domain isn't recollected within `--bloodhound-ttl` (default 24h), even across runs and unrelated credential pairs. `--bloodhound-force` to override.
-- **Verbosity controls (`-v`/`-vv`/`-q`)** — From silent (only valid creds) to full debug (raw nxc/nmap output, cache hit/miss, per-attempt command dump).
-- **Commands transcript (`commands-*.log`)** — Every command launched (nxc auth, nxc post-exploit, nmap, bloodhound-python) is appended to a timestamped log in **shell-quoted, copy-paste-ready** form. Perfect for OSCP-style reports — open the file, grab the line, paste into the writeup. Disable with `--no-cmd-log`.
+## Contents
 
-## Requirements
+- [Why](#why)
+- [Quick Start](#quick-start)
+- [Features](#features)
+- [Install](#install)
+  - [Standard](#standard)
+  - [Air-gapped bundle (offline)](#air-gapped-bundle-offline)
+  - [Docker (offline-friendly)](#docker-offline-friendly)
+- [Usage](#usage)
+  - [Authentication options](#authentication-options)
+  - [Nmap pre-scan & cache](#nmap-pre-scan--cache)
+  - [Auto post-exploitation](#auto-post-exploitation)
+  - [Performance & low-power VMs](#performance--low-power-vms)
+  - [Output, verbosity, and the commands transcript](#output-verbosity-and-the-commands-transcript)
+- [Combo file format](#combo-file-format)
+- [CLI reference](#cli-reference)
+- [Tuning constants](#tuning-constants)
+- [Disclaimer](#disclaimer)
 
-- Python 3.10+
-- [NetExec](https://github.com/Pennyw0rth/NetExec) installed and available as `nxc` in PATH
-- [nmap](https://nmap.org/) in PATH — only required when using `--nmap` / `--scan-only`
-- [bloodhound-python](https://github.com/dirkjanm/BloodHound.py) (`pip install bloodhound`) in PATH — only required when using `--bloodhound`
+---
 
-## Usage
+## Why
+
+`nxc` is great for a single (protocol, target, cred) triple, but on a real engagement you want to fan out across many protocols × many hosts × many credentials, capture only the real findings, skip dead hosts, document every command for the report, and pivot into post-exploit (BloodHound, SMB enum, modules) without doing it by hand.
+
+**NetExec Automator does that in one command.** It's a single Python file (stdlib only) — drop it next to `nxc` and you're done.
+
+---
+
+## Quick Start
 
 ```bash
-# Single target, single credential
-python3 netexec-automator.py -t 10.10.10.1 -u admin -p 'Password123!'
+# 1. Single target, single credential — quickest possible run
+python3 netexec-automator.py -t 10.10.10.5 -u admin -p 'Password123!'
 
-# File-based inputs — the intended workflow
-python3 netexec-automator.py -t targets.txt -u users.txt -p passwords.txt
+# 2. File-based spray with nmap pre-scan (skips dead hosts & closed-port protocols)
+python3 netexec-automator.py -t targets.txt -u users.txt -p passwords.txt --nmap
 
-# Linear mode — each user[i] paired only with password[i]
-python3 netexec-automator.py -t targets.txt -u users.txt -p passwords.txt -m linear
+# 3. Combo file (mixed user:password + user:hash auto-detected per line)
+python3 netexec-automator.py -t targets.txt --combo loot.txt --nmap
 
-# Custom output file and worker count
-python3 netexec-automator.py -t 10.10.10.1 -u admin -p pass.txt -o results.txt -w 20
-
-# Smart mode — nmap pre-scan + cache. Skips protocols on closed ports.
-python3 netexec-automator.py -t 10.10.10.0/24 -u users.txt -p passwords.txt --nmap
-
-# Recon only — discover open ports without firing any nxc auth attempts
-python3 netexec-automator.py -t 10.10.10.0/24 -u x -p x --scan-only
-
-# Pass-the-hash — single NT hash, with explicit domain
+# 4. Pass-the-hash with explicit domain
 python3 netexec-automator.py -t dc01 -u administrator \
     -H 8846f7eaee8fb117ad06bdd830b7586c -d corp.local
 
-# Combo file (mix of passwords + NT hashes + LM:NT hashes, auto-detected)
-python3 netexec-automator.py -t targets.txt --combo loot.txt --nmap
+# 5. Full pwn chain — pre-scan, spray, post-exploit, BloodHound, verbose for the report
+python3 netexec-automator.py -t 10.10.10.0/24 --combo loot.txt --nmap \
+    --null-session --enum --modules spider_plus,gpp_password --bloodhound -v
 
-# Quick anonymous wins (null session, Guest:'', anonymous:'') before spraying
-python3 netexec-automator.py -t targets.txt -u users.txt -p passwords.txt --null-session
+# 6. Low-power profile (small VM, 4GB RAM, slow link) — 3 workers, longer timeouts, paced
+python3 netexec-automator.py -t targets.txt --combo loot.txt --nmap --low-power
 
-# Kerberos auth with an existing ccache
-export KRB5CCNAME=/tmp/krb5cc_user
-python3 netexec-automator.py -t dc01 -u administrator -p ignored -k -d corp.local
-
-# Full chain — pre-scan, hash spray, post-exploit enum, BloodHound, debug verbosity
-python3 netexec-automator.py -t 10.10.10.0/24 --combo loot.txt \
-    --nmap --null-session --enum --modules spider_plus,gpp_password \
-    --bloodhound -vv
-
-# Only show valid credentials (great for piping or quick triage)
-python3 netexec-automator.py -t targets.txt --combo loot.txt --nmap -q
+# 7. Recon only — get open ports per host, no auth attempts
+python3 netexec-automator.py -t 10.10.10.0/24 -u x -p x --scan-only
 ```
 
-## Options
+`python3 netexec-automator.py --help` shows every flag, grouped by purpose, with examples.
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-t, --target` | Target IP/hostname or path to targets file | *required* |
-| `-u, --user` | Username or path to users file | *(unless --combo or --null-session)* |
-| `-p, --password` | Password or path to passwords file | — |
-| `-H, --hash` | NT hash (32 hex), LM:NT (32:32 hex), or path to hashes file | — |
-| `-d, --domain` | Active Directory domain (added as `-d` to nxc for domain auth) | — |
-| `-k, --kerberos` | Use Kerberos auth (requires valid ccache via `KRB5CCNAME`) | `off` |
-| `--combo` | Path to user:secret combo file (auto-detects pwd vs NT/LM:NT hash) | — |
-| `--null-session` | Also try `null`/`Guest:''`/`anonymous:''` as cheap quick-wins | `off` |
-| `-o, --output` | Custom log file path | `HH-MM-SS-mmm.txt` |
-| `-w, --workers` | Number of parallel threads | `15` |
-| `-m, --mode` | Credential pairing: `combination` (all pairs) or `linear` (index-matched) | `combination` |
-| `--nmap` | Pre-scan target ports with nmap and skip protocols on closed ports | `off` |
-| `--no-cache` | Bypass the SQLite nmap result cache (only relevant with `--nmap`) | `off` |
-| `--cache-ttl` | Seconds nmap cache entries remain valid | `86400` (24h) |
-| `--scan-only` | Run nmap discovery only — no auth attempts. Implies `--nmap` | `off` |
-| `-v, --verbose` | Increase verbosity (`-v` adds commands + failed-auth lines, `-vv` adds raw nxc/nmap output) | `0` |
-| `-q, --quiet` | Print only valid credentials (suppresses banner, per-host headers, summary) | `off` |
-| `--enum` | On valid SMB creds, run `--shares`/`--users`/`--sessions`/`--loggedon-users`/`--pass-pol` into `loot/` | `off` |
-| `--modules` | Comma-separated nxc `-M` modules to run on valid SMB creds (e.g. `spider_plus,gpp_password`) | — |
-| `--bloodhound` | Auto-collect BloodHound (`bloodhound-python -c All --zip`) per discovered AD domain | `off` |
-| `--bloodhound-force` | Bypass the per-domain dedup cache and re-run BloodHound | `off` |
-| `--bloodhound-ttl` | Dedup window for BloodHound runs per domain (seconds) | `86400` (24h) |
-| `--loot-dir` | Root directory for enum/modules/bloodhound output | `loot/` |
-| `--cmd-log` | Path for the shell-quoted commands transcript | `commands-HH-MM-SS-mmm.log` |
-| `--no-cmd-log` | Disable the commands transcript file | `off` |
+---
 
-### Credential sources — accepted combinations
+## Features
 
-| Mode | Required flags |
-|------|----------------|
-| Password spray | `-u <user|file> -p <pwd|file>` |
-| Pass-the-hash | `-u <user|file> -H <hash|file>` |
-| Both | `-u <user|file> -p ... -H ...` (combination mode only — full cartesian) |
-| Combo file | `--combo file.txt` (mutually exclusive with `-u/-p/-H`) |
-| Anonymous only | `--null-session` (no `-u` required) |
+| Area | What you get |
+|------|-------------|
+| **Protocols** | SMB, SSH, LDAP, FTP, WMI, WinRM, RDP, VNC, MSSQL, NFS — plus `--local-auth` variants for SMB/WMI/WinRM/RDP/MSSQL |
+| **Credential pairing** | `combination` (cartesian, default), `linear` (1-to-1), or `--combo` file |
+| **Auth methods** | Passwords (`-p`), NT or LM:NT hashes (`-H`), Kerberos ccache (`-k`), null session + Guest + anonymous (`--null-session`) |
+| **Pre-scan** | `--nmap` discovers open ports first → skips protocols with no open port → skips dead hosts entirely |
+| **Cache** | SQLite at `~/.cache/netexec-automator/state.db` — nmap results, DC discoveries, BloodHound dedup |
+| **Post-exploit** | `--enum` (shares/users/sessions/loggedon/pass-pol), `--modules X,Y` (nxc `-M`), `--bloodhound` (auto-DC, dedup per domain) |
+| **Reporting** | `commands-*.log` with every command in shell-quoted, copy-pasteable form. Loot tree under `loot/<host>/<proto>/<scope>/` |
+| **Pacing** | `--low-power` preset for weak VMs; `--delay` + `--jitter` for lockout-safe spraying |
+| **Output** | Live `[+]` highlights, per-host summary, `-q` for creds-only, `-v`/`-vv` for full debug |
 
-`--null-session` can be added on top of any of the above to prepend the anonymous quick-wins.
+---
 
-### Combo file format
+## Install
 
-```
-# Lines beginning with # are comments. Blank lines are ignored.
-administrator:S3cr3tP@ssword!
-svc_backup:8846f7eaee8fb117ad06bdd830b7586c
-legacy_user:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0
-guest:
-domain\dev:Spring2025!
+### Standard
+
+Requirements:
+- Python 3.10+
+- [NetExec](https://github.com/Pennyw0rth/NetExec) (`nxc` in `PATH`)
+- [nmap](https://nmap.org/) — only for `--nmap` / `--scan-only`
+- [bloodhound-python](https://github.com/dirkjanm/BloodHound.py) (`pip install bloodhound`) — only for `--bloodhound`
+
+The tool itself is a single Python file with **no external dependencies** (stdlib only):
+
+```bash
+git clone https://github.com/Givaa/netexec-automator
+cd netexec-automator
+python3 netexec-automator.py --help
 ```
 
-The secret on each line is auto-detected:
-- 32 hex characters → NT hash (`-H`)
-- 32:32 hex characters → LM:NT hash (`-H lm:nt`)
-- anything else → password (preserves embedded colons and surrounding whitespace)
+### Air-gapped bundle (offline)
 
-## Output
+On a build host **with** internet:
 
-The tool produces three sections:
-
-### 1. Live Scan
-
-Findings appear in real-time as protocols are tested:
-
-```
-  ► 10.10.10.1
-
-  ⚡ SMB (domain) corp.local\admin:Password123!
-  ⚡ LDAP (domain) corp.local\admin:Password123!
-  ⏱ SSH (domain) 3 consecutive timeouts — skipping
+```bash
+./scripts/bundle-airgapped.sh
+# → dist/netexec-automator-airgapped-YYYYMMDD.tar.gz
 ```
 
-### 2. Detailed Results
+The script bundles:
+- `netexec-automator.py` + README + LICENSE
+- `wheels/` — pip wheels for `netexec` + `bloodhound` + all transitive deps
+- `bin/nxc` — pre-built NetExec Linux x64 binary (fetched from the latest GitHub release, optional)
+- `install-offline.sh` — one-shot installer for the target host
 
-After scanning completes, all results are shown grouped by protocol:
+On the air-gapped target:
 
-```
-────────────────────────────────────────────────────────────
-  📋 NetExec Automator Results
-────────────────────────────────────────────────────────────
-    Windows 10 / Server 2019 Build 17763 x64 (name:DC01) (domain:corp.local)
-
-  ✔ SMB (domain)         corp.local\admin:Password123!
-  ✘ SMB (local)          DC01\admin:Password123! STATUS_LOGON_FAILURE
-  ✔ LDAP (domain)        corp.local\admin:Password123!
-  ⏱ SSH (domain)         3 consecutive timeouts — skipped
-
-  ── No response: FTP, VNC, NFS
+```bash
+tar xzf netexec-automator-airgapped-*.tar.gz
+cd netexec-automator-airgapped-*
+./install-offline.sh                # creates a venv, pip install --no-index, drops nxc in /usr/local/bin
 ```
 
-### 3. Summary
+Knobs:
+- `SKIP_NXC_BINARY=1` — skip the GitHub binary fetch (wheels only)
+- `INCLUDE_BLOODHOUND=0` — drop bloodhound-python from the bundle
+- `PIP_PLATFORM=manylinux2014_x86_64` — cross-bundle wheels for a different platform
 
-A clean list of only the valid credentials:
+### Docker (offline-friendly)
 
+```bash
+# Build on a host with internet
+docker build -t netexec-automator:latest .
+
+# Export for offline transfer
+docker save netexec-automator:latest | gzip > netexec-automator.tar.gz
+
+# Import on the air-gapped host
+gunzip -c netexec-automator.tar.gz | docker load
+
+# Run (--network host so the container can reach internal subnets directly)
+docker run --rm -it --network host -v "$PWD":/work netexec-automator \
+    -t /work/targets.txt --combo /work/loot.txt --nmap --low-power \
+    --loot-dir /work/loot --cmd-log /work/commands.log
 ```
-  ✓ VALID CREDENTIALS
 
-    ► SMB (domain)         │ corp.local\admin:Password123!
-    ► LDAP (domain)        │ corp.local\admin:Password123!
-```
+The image bundles `nxc`, `nmap`, and `bloodhound-python`. Drop with `--build-arg INSTALL_NMAP=0` or `INSTALL_BLOODHOUND=0` if you want a slimmer image.
 
-## Credential Pairing Modes
+---
 
-| Mode | Behavior | Example (2 users, 3 passwords) |
-|------|----------|-------------------------------|
-| `combination` | Cartesian product — every user tested with every password | 2 × 3 = **6 pairs** |
-| `linear` | Index-matched — user[i] paired only with password[i] (lists must be equal length) | **not allowed** (lengths differ) |
+## Usage
 
-**combination** (default) is ideal when you have separate wordlists. **linear** is useful when you have known `user:password` pairs (e.g. from a credential dump) and want to test each pair as-is.
+### Authentication options
 
-## Nmap Pre-scan & Cache
+| Source | Required flags | Notes |
+|--------|----------------|-------|
+| Password | `-u <user\|file> -p <pwd\|file>` | The classic spray |
+| Hash (PTH) | `-u <user\|file> -H <hash\|file>` | Auto-skipped on SSH/FTP/VNC/NFS |
+| Both | `-u … -p … -H …` (combination mode only) | Full cartesian product |
+| Combo file | `--combo file.txt` | Mutually exclusive with `-u/-p/-H` |
+| Kerberos | `-u … -k -d <domain>` | Requires valid ccache via `KRB5CCNAME` |
+| Anonymous quick-wins | `--null-session` | Adds `""`/`Guest:''`/`anonymous:''` |
 
-With `--nmap`, the tool runs `nmap -Pn -n --open -p <known-ports> -T4` against each target before any nxc attempt. Only protocols whose mapped ports are open are then tested. CIDR/range specs are expanded by nmap itself — dead hosts disappear entirely.
+You can combine `--null-session` with any of the others to prepend the cheap wins.
 
-Port mapping used by the pre-scan:
+**Domain auth** (`-d corp.local`) is appended automatically as `-d` for `nxc`, and *suppressed* on `--local-auth` runs to keep nxc happy.
 
-| Protocol | Ports |
-|----------|-------|
+### Nmap pre-scan & cache
+
+With `--nmap`, the tool runs `nmap -Pn -n --open -p <known-ports> -T4` against each target before any auth attempt. Only protocols whose mapped ports are open are then tested. CIDR/range specs are expanded by nmap — dead hosts disappear entirely.
+
+| Protocol | Probed ports |
+|----------|--------------|
 | SMB | 445, 139 |
 | SSH | 22 |
 | LDAP | 389, 636 |
@@ -229,63 +191,60 @@ Port mapping used by the pre-scan:
 | MSSQL | 1433 |
 | NFS | 2049 |
 
-Results are persisted in `~/.cache/netexec-automator/state.db` (SQLite). Subsequent runs against the same host hit the cache and skip nmap entirely (until `--cache-ttl` expires or `--no-cache` is passed). Dead hosts are also cached, so re-running a `/24` doesn't re-probe known unreachable IPs.
+Results land in `~/.cache/netexec-automator/state.db`. Subsequent runs hit the cache (instant) until `--cache-ttl` (default 24h) expires, or you pass `--no-cache` for a forced re-scan. Dead hosts are cached too (sentinel row) so re-running a `/24` doesn't re-probe known-unreachable IPs.
 
-```bash
-# First run — nmap probes, results cached
-python3 netexec-automator.py -t 10.10.10.0/24 -u users.txt -p passwords.txt --nmap
+### Auto post-exploitation
 
-# Second run — cache hit, no nmap overhead
-python3 netexec-automator.py -t 10.10.10.0/24 -u users.txt -p passwords.txt --nmap
+When `--enum`, `--modules`, or `--bloodhound` are on, a follow-up phase runs **per host** as soon as the spray completes — without interfering with the live progress bar.
 
-# Force fresh scan
-python3 netexec-automator.py -t 10.10.10.0/24 -u users.txt -p passwords.txt --nmap --no-cache
-```
+**`--enum` (SMB)** runs against the strongest valid SMB cred (domain auth > local, password > hash):
 
-## Auto Post-Exploitation
-
-When `--enum`, `--modules`, or `--bloodhound` are on, the tool runs a follow-up phase **per host** as soon as the credential spray for that host completes (so it doesn't interfere with the live progress bar).
-
-### `--enum` (SMB)
-
-For each host with a valid SMB credential (best one preferred: domain auth > local auth, password > hash), runs:
-
-| Probe | nxc flag | Output file |
-|-------|----------|-------------|
+| Probe | Flag | Output |
+|-------|------|--------|
 | Shares | `--shares` | `loot/<host>/smb/<scope>/shares.txt` |
 | Users | `--users` | `loot/<host>/smb/<scope>/users.txt` |
 | Sessions | `--sessions` | `loot/<host>/smb/<scope>/sessions.txt` |
 | Logged-on | `--loggedon-users` | `loot/<host>/smb/<scope>/loggedon.txt` |
 | Password policy | `--pass-pol` | `loot/<host>/smb/<scope>/pass-pol.txt` |
 
-`<scope>` is `domain` or `local`.
+**`--modules X,Y`** runs any nxc `-M` module, comma-separated, into `loot/<host>/smb/<scope>/module-<name>.txt`.
 
-### `--modules`
+**`--bloodhound`** runs after all hosts have been sprayed. For each AD domain seen in nxc SMB banners:
+1. Identify DC candidates (host advertised the domain AND has LDAP+SMB open, when `--nmap` is on).
+2. Pick the best domain credential available.
+3. Run `bloodhound-python -c All --zip` once → `loot/bloodhound/<domain>/<timestamp>/` (zip + stdout/stderr logs).
+4. Persist the successful run in SQLite so the same domain is **never** recollected within `--bloodhound-ttl` (default 24h), even across runs and unrelated credential pairs. `--bloodhound-force` overrides.
 
-Any nxc `-M` module name can be passed, comma-separated. Output goes to `loot/<host>/smb/<scope>/module-<name>.txt`.
+### Performance & low-power VMs
 
-### `--bloodhound` (auto-DC discovery + collection)
-
-After all hosts are sprayed:
-1. Each AD domain seen in nxc SMB banners is recorded with the candidate DCs that exposed it.
-2. A host is treated as a likely DC if it advertised the domain **and** has both LDAP (389/636) and SMB (445) open (when `--nmap` is on). Without nmap, the SMB banner advertisement is sufficient.
-3. For each unique domain, `bloodhound-python -c All --zip` runs once using the strongest available domain credential. Output is written to `loot/bloodhound/<domain>/<timestamp>/` along with the raw stdout/stderr logs.
-4. Successful collections are recorded in the SQLite cache. Subsequent runs against the same domain within `--bloodhound-ttl` (default 24h) are skipped automatically — even across unrelated credential pairs and unrelated hosts. Override with `--bloodhound-force`.
+If your Kali VM gets crushed by 15 parallel `nxc` subprocesses, use the preset:
 
 ```bash
-# First run on /24 — finds creds, identifies DC, collects BloodHound for corp.local
-python3 netexec-automator.py -t 10.10.10.0/24 -u users.txt -p passwords.txt --nmap --bloodhound
-
-# Few hours later, sprayed a different cred set — BloodHound is NOT re-collected for corp.local
-python3 netexec-automator.py -t 10.10.10.0/24 --combo new_loot.txt --nmap --bloodhound
-
-# Force re-collection (e.g. after major AD changes)
-python3 netexec-automator.py -t 10.10.10.0/24 --combo new_loot.txt --nmap --bloodhound --bloodhound-force
+python3 netexec-automator.py -t targets.txt --combo loot.txt --nmap --low-power
 ```
 
-## Commands Transcript (OSCP-friendly)
+`--low-power` sets: `workers=3`, `max-retry=1`, `netexec-timeout=45s`, `subprocess-timeout=60s`, `delay=0.5s`. Each individual knob can also be overridden:
 
-Every command the tool fires — nmap port discovery, each nxc auth attempt, post-exploit `--shares`/`--users`/etc., nxc `-M` modules, and `bloodhound-python` — is appended to a timestamped log in **shell-pasteable form** (passwords with spaces, backticks, `$`, quotes, and backslashes in usernames are all correctly quoted with `shlex`).
+```bash
+# Conservative spray to dodge account-lockout
+python3 netexec-automator.py -t … -u users.txt -p passwords.txt --delay 2 --jitter 3
+
+# Manual tuning on top of low-power
+python3 netexec-automator.py -t … --combo … --nmap --low-power -w 5 --delay 0
+```
+
+### Output, verbosity, and the commands transcript
+
+**Verbosity:**
+
+| Mode | Flag | Shows |
+|------|------|-------|
+| Quiet | `-q` | Only valid credentials (one per line) — pipe-friendly |
+| Normal | *(default)* | Banner, live `[+]` finds, timeout skips, per-host summary |
+| Verbose | `-v` | + each nxc command before execution, failed-auth `[-]` lines, cache hit/miss, DC candidate detection |
+| Debug | `-vv` | + raw `[*]` info lines, nmap raw stats |
+
+**Commands transcript** (OSCP-friendly): every command the tool fires — nmap, each nxc auth attempt, post-exploit `--shares`/`--users`/etc., nxc `-M` modules, `bloodhound-python` — is appended to `commands-HH-MM-SS-mmm.log` in **shell-quoted form** (passwords with spaces/quotes/`$`/backticks and usernames with backslashes all correctly escaped):
 
 ```
 # NetExec Automator — commands transcript
@@ -294,41 +253,94 @@ Every command the tool fires — nmap port discovery, each nxc auth attempt, pos
 # 2026-05-24T15:43:35 [nmap] target=10.10.10.0/24
 nmap -Pn -n --open -p 445,139,22,389,636,21,135,5985,5986,3389,5900,1433,2049 -T4 -oX - 10.10.10.0/24
 
-# 2026-05-24T15:43:48 [SMB (domain)] target=10.10.10.5
-nxc smb 10.10.10.5 -u 'dom\admin' -p 'P@ss w0rd '"'"'$x`' -d corp.local --timeout 30 --log 15-43-35-713.txt
-
 # 2026-05-24T15:43:51 [SMB (domain)] target=10.10.10.5
 nxc smb 10.10.10.5 -u svc -H 8846f7eaee8fb117ad06bdd830b7586c -d corp.local --timeout 30 --log 15-43-35-713.txt
-
-# 2026-05-24T15:44:02 [post-ex --shares] target=10.10.10.5
-nxc smb 10.10.10.5 -u 'dom\admin' -p 'P@ss w0rd '"'"'$x`' -d corp.local --timeout 30 --shares
 
 # 2026-05-24T15:44:18 [bloodhound corp.local] target=10.10.10.5
 bloodhound-python -c All -u 'dom\admin' -d corp.local -dc 10.10.10.5 -ns 10.10.10.5 --zip -p 'P@ss w0rd '"'"'$x`'
 ```
 
-Default filename: `commands-HH-MM-SS-mmm.log` in the cwd. Override with `--cmd-log /path/to/file`, suppress with `--no-cmd-log`.
+Override the path with `--cmd-log /path/to/file`. Disable with `--no-cmd-log`.
 
-## Verbosity
+---
 
-| Mode | Flag | Shows |
-|------|------|-------|
-| Quiet | `-q` | Only valid credentials (one per line) |
-| Normal | *(default)* | Banner, live `[+]` finds, timeout skips, per-host summary |
-| Verbose | `-v` | + each nxc command before execution, failed-auth `[-]` lines, cache hit/miss, DC candidate detection |
-| Debug | `-vv` | + raw `[*]` info lines, nmap result counts |
+## Combo file format
 
-## Configuration
+```
+# Lines starting with # are comments. Blank lines are ignored.
+administrator:S3cr3tP@ssword!
+svc_backup:8846f7eaee8fb117ad06bdd830b7586c
+legacy_user:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0
+guest:
+domain\dev:Spring2025!
+```
 
-Constants at the top of the script:
+The secret on each line is auto-detected:
+- **32 hex chars** → NT hash (`-H`)
+- **32:32 hex chars** → LM:NT hash (`-H lm:nt`)
+- anything else → password (embedded `:` and surrounding whitespace are preserved)
+
+---
+
+## CLI reference
+
+`python3 netexec-automator.py --help` for the authoritative help. Flags are grouped: **target · credentials · nmap pre-scan & cache · post-exploitation · performance & pacing · output & logging**.
+
+Most-used flags at a glance:
+
+| Flag | Default | What it does |
+|------|---------|-------------|
+| `-t, --target` | *(required)* | IP/hostname/CIDR or path to a targets file |
+| `-u, --user` | — | Username or path to users file |
+| `-p, --password` | — | Password or path to passwords file |
+| `-H, --hash` | — | NT or LM:NT hash, single or file |
+| `-d, --domain` | — | Active Directory domain |
+| `-k, --kerberos` | off | Use ccache via `KRB5CCNAME` |
+| `--combo` | — | `user:secret` combo file (auto-detects pwd vs hash) |
+| `--null-session` | off | Prepend null/Guest/anonymous attempts |
+| `--nmap` | off | Port pre-scan; only spray protocols with open ports |
+| `--scan-only` | off | Pre-scan only, no auth attempts |
+| `--no-cache` | off | Bypass SQLite cache |
+| `--cache-ttl` | 86400 | Nmap cache validity in seconds |
+| `--enum` | off | SMB enum probes into `loot/` |
+| `--modules` | — | Comma-separated nxc `-M` modules |
+| `--bloodhound` | off | Auto-collect BloodHound per discovered domain |
+| `--bloodhound-force` | off | Bypass per-domain dedup |
+| `--bloodhound-ttl` | 86400 | Per-domain dedup window |
+| `--loot-dir` | `loot/` | Root for enum/modules/bloodhound output |
+| `--low-power` | off | Preset: 3 workers, retry=1, longer timeouts, small delay |
+| `-w, --workers` | 15 | Parallel threads |
+| `--delay` | 0 | Sleep between credential attempts (seconds) |
+| `--jitter` | 0 | Random additional sleep (0..jitter) |
+| `--netexec-timeout` | 30 | Per-attempt nxc `--timeout` |
+| `--subprocess-timeout` | 45 | Hard Python timeout per nxc call |
+| `--max-retry` | 3 | Skip a protocol after N consecutive timeouts |
+| `-o, --output` | timestamped | nxc `--log` file path |
+| `--cmd-log` | timestamped | Shell-quoted commands transcript |
+| `--no-cmd-log` | off | Disable the transcript file |
+| `-v, --verbose` | 0 | `-v` commands+errors, `-vv` raw output |
+| `-q, --quiet` | off | Only print valid creds |
+| `-m, --mode` | `combination` | `combination` (cartesian) or `linear` (1-to-1) |
+
+---
+
+## Tuning constants
+
+Defaults at the top of `netexec-automator.py`. The CLI flags above override all of these; edit only if you need different baseline values:
 
 | Constant | Value | Description |
 |----------|-------|-------------|
 | `MAX_RETRY` | `3` | Consecutive connectivity timeouts before skipping a protocol |
-| `NETEXEC_TIMEOUT` | `30` | nxc `--timeout` per connection attempt (seconds) |
-| `SUBPROCESS_TIMEOUT` | `45` | Python-level safety timeout per nxc command (seconds) |
-| `DEFAULT_WORKERS` | `15` | Thread pool size (10 protocols + 5 local auth) |
+| `NETEXEC_TIMEOUT` | `30` | Per-attempt nxc `--timeout` (seconds) |
+| `SUBPROCESS_TIMEOUT` | `45` | Python-level hard timeout per nxc call (seconds) |
+| `DEFAULT_WORKERS` | `15` | Thread pool size (10 protocols + 5 local-auth variants) |
+| `LOW_POWER_PROFILE` | dict | Workers/retry/timeout/delay applied by `--low-power` |
+| `PROTOCOL_PORTS` | dict | Protocol → TCP ports nmap probes |
+| `CACHE_DEFAULT_TTL` | `86400` | Cache validity (seconds) |
+| `BLOODHOUND_TIMEOUT` | `600` | Hard timeout per `bloodhound-python` invocation |
+
+---
 
 ## Disclaimer
 
-This tool is intended for authorized penetration testing and security assessments only. Always ensure you have explicit written permission before testing credentials against any target. Unauthorized access to computer systems is illegal.
+For authorized security testing only. Always ensure you have explicit written permission before testing credentials against any target. Unauthorized access to computer systems is illegal.

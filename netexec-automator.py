@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import random
 import re
 import shlex
 import sqlite3
@@ -68,6 +69,17 @@ CACHE_DEFAULT_TTL = 86400  # 24h
 CACHE_DEFAULT_PATH = Path.home() / ".cache" / "netexec-automator" / "state.db"
 NMAP_TIMEOUT = 180
 BLOODHOUND_TIMEOUT = 600
+
+# Profile presets — applied when the corresponding flag is given.
+# 'low-power' is intended for VMs / weak hosts: minimal parallelism, longer
+# timeouts so we don't hammer the local CPU or network stack.
+LOW_POWER_PROFILE = {
+    "workers": 3,
+    "max_retry": 1,
+    "netexec_timeout": 45,
+    "subprocess_timeout": 60,
+    "delay": 0.5,
+}
 
 # Verbosity levels
 V_QUIET = -1
@@ -468,6 +480,11 @@ class NxcAutomator:
         loot_dir: str = "loot",
         cmd_log: str | None = None,
         cmd_log_disabled: bool = False,
+        delay: float = 0.0,
+        jitter: float = 0.0,
+        netexec_timeout: int = NETEXEC_TIMEOUT,
+        subprocess_timeout: int = SUBPROCESS_TIMEOUT,
+        max_retry: int = MAX_RETRY,
     ):
         self.targets = self._read_value_or_file(target)
         self.mode = mode.lower()
@@ -488,6 +505,11 @@ class NxcAutomator:
         self.credentials = self._build_credentials()
 
         self.workers = workers
+        self.delay = max(0.0, delay)
+        self.jitter = max(0.0, jitter)
+        self.netexec_timeout = netexec_timeout
+        self.subprocess_timeout = subprocess_timeout
+        self.max_retry = max_retry
         self.lock = Lock()
         self.cmd_log_lock = Lock()
         self.completed = 0
@@ -749,7 +771,7 @@ class NxcAutomator:
             cmd.extend(["-d", self.domain])
         if self.kerberos and not local_auth and protocol in KERBEROS_AUTH_PROTOCOLS:
             cmd.append("-k")
-        cmd.extend(["--timeout", str(NETEXEC_TIMEOUT), "--log", self.log_file])
+        cmd.extend(["--timeout", str(self.netexec_timeout), "--log", self.log_file])
         return cmd
 
     @staticmethod
@@ -836,13 +858,23 @@ class NxcAutomator:
                 formatted.append(f"{fallback_marker} {line}")
         return "\n".join(formatted) if formatted else None
 
+    def _sleep_between_attempts(self):
+        """Optional pacing between credential attempts for lockout-safety / low-power."""
+        if self.delay <= 0 and self.jitter <= 0:
+            return
+        nap = self.delay + (random.uniform(0, self.jitter) if self.jitter > 0 else 0)
+        if nap > 0:
+            time.sleep(nap)
+
     def _run_protocol_task(self, protocol: str, target: str, local_auth: bool = False) -> list[str]:
         """Run all credential pairs for one protocol/auth-type, return captured output."""
         output_lines: list[str] = []
         timeout_count = 0
         total_per_task = len(self.credentials)
         ran = 0
-        for credential in self.credentials:
+        for idx, credential in enumerate(self.credentials):
+            if idx > 0:
+                self._sleep_between_attempts()
             if not self._credential_supported(credential, protocol):
                 # Hash creds aren't usable on ssh/ftp/vnc/nfs — count as done, move on.
                 self._vprint(
@@ -856,7 +888,7 @@ class NxcAutomator:
             cmd = self._build_nxc_command(protocol, target, credential, local_auth)
             self._log_command(self._task_label(protocol, local_auth), cmd, target=target)
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=self.subprocess_timeout)
                 stdout = (result.stdout or "").strip()
                 stderr = (result.stderr or "").strip()
                 classification = self._classify_attempt_output(stdout, stderr)
@@ -883,12 +915,12 @@ class NxcAutomator:
             ran += 1
             self._update_progress()
 
-            if timeout_count >= MAX_RETRY:
+            if timeout_count >= self.max_retry:
                 # Skip remaining credentials for this protocol after repeated timeouts.
-                output_lines.append(f"[!] {MAX_RETRY} consecutive timeouts — skipped")
+                output_lines.append(f"[!] {self.max_retry} consecutive timeouts — skipped")
                 label = self._task_label(protocol, local_auth)
                 self._print_live(
-                    f"  {YELLOW}⏱ {label}{RESET} {DIM}{MAX_RETRY} consecutive timeouts — skipping{RESET}"
+                    f"  {YELLOW}⏱ {label}{RESET} {DIM}{self.max_retry} consecutive timeouts — skipping{RESET}"
                 )
                 remaining = total_per_task - ran
                 if remaining > 0:
@@ -976,6 +1008,15 @@ class NxcAutomator:
         print(f"  Verbosity       {DIM}│{RESET} {BOLD}{verbosity_label:<11}{RESET} Loot Dir  {DIM}│{RESET} {BOLD}{self.loot.root}{RESET}")
         cmd_log_str = str(self.cmd_log_path) if self.cmd_log_path else "disabled"
         print(f"  Command Log     {DIM}│{RESET} {BOLD}{cmd_log_str}{RESET}")
+        pacing = []
+        if self.delay > 0 or self.jitter > 0:
+            pacing.append(f"delay={self.delay}s±{self.jitter}s")
+        if self.netexec_timeout != NETEXEC_TIMEOUT or self.subprocess_timeout != SUBPROCESS_TIMEOUT or self.max_retry != MAX_RETRY:
+            pacing.append(f"nxc-to={self.netexec_timeout}s")
+            pacing.append(f"py-to={self.subprocess_timeout}s")
+            pacing.append(f"retry={self.max_retry}")
+        if pacing:
+            print(f"  Pacing          {DIM}│{RESET} {BOLD}{' · '.join(pacing)}{RESET}")
         if self.scan_only:
             print(f"  {YELLOW}{BOLD}⚠ scan-only mode — no auth attempts will run{RESET}")
         else:
@@ -1178,11 +1219,11 @@ class NxcAutomator:
         cmd.extend(extra_args)
         self._log_command(f"post-ex {' '.join(extra_args)}".strip(), cmd, target=host)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=self.subprocess_timeout)
             loot_path.write_text((result.stdout or "") + ("\n--- stderr ---\n" + result.stderr if result.stderr else ""))
             return result.returncode == 0
         except subprocess.TimeoutExpired:
-            loot_path.write_text(f"timed out after {SUBPROCESS_TIMEOUT}s")
+            loot_path.write_text(f"timed out after {self.subprocess_timeout}s")
             return False
 
     def _post_exploit_host(self, host: str, host_valid: list[dict]):
@@ -1411,94 +1452,160 @@ def parse_mode(value: str) -> str:
     raise argparse.ArgumentTypeError("Mode must be one of: combination, linear")
 
 
+EXAMPLES_EPILOG = """\
+examples:
+  # 1. Single host, single credential — quickest possible run
+  %(prog)s -t 10.10.10.5 -u admin -p 'Password123!'
+
+  # 2. File-based spray across a CIDR with nmap pre-scan (skips dead hosts/protocols)
+  %(prog)s -t targets.txt -u users.txt -p passwords.txt --nmap
+
+  # 3. Combo file with mixed passwords + NT/LM:NT hashes (auto-detected per line)
+  %(prog)s -t targets.txt --combo loot.txt --nmap
+
+  # 4. Pass-the-hash with explicit domain
+  %(prog)s -t dc01 -u administrator -H 8846f7eaee8fb117ad06bdd830b7586c -d corp.local
+
+  # 5. Anonymous quick-wins before the main spray
+  %(prog)s -t targets.txt -u users.txt -p passwords.txt --null-session
+
+  # 6. Full chain: pre-scan, spray, post-exploit enum, BloodHound, verbose
+  %(prog)s -t 10.10.10.0/24 --combo loot.txt --nmap --null-session \\
+           --enum --modules spider_plus,gpp_password --bloodhound -v
+
+  # 7. Recon only — discover open ports without firing any nxc auth attempts
+  %(prog)s -t 10.10.10.0/24 -u x -p x --scan-only
+
+  # 8. Low-power profile for VMs / weak hosts — 3 workers, 1 retry, paced
+  %(prog)s -t targets.txt --combo loot.txt --nmap --low-power
+
+  # 9. Quiet mode (only valid creds) — handy for piping
+  %(prog)s -t targets.txt --combo loot.txt --nmap -q
+"""
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run nxc across all protocols with combination or linear credential pairing."
+        description="Spray NetExec (nxc) across all 10 protocols in parallel — "
+                    "with nmap pre-scan, hash/Kerberos auth, auto-enum, and BloodHound collection.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=EXAMPLES_EPILOG,
     )
-    parser.add_argument("-t", "--target", required=True, help="Target IP/hostname or path to targets.txt")
-    parser.add_argument("-u", "--user", help="Username, or path to users.txt")
-    parser.add_argument("-p", "--password", help="Password, or path to passwords.txt")
-    parser.add_argument("-H", "--hash", dest="nthash",
-                        help="NT hash (32 hex), LM:NT (32:32 hex), or path to hashes.txt")
-    parser.add_argument("-d", "--domain",
-                        help="Active Directory domain — appended to nxc with -d for domain auth")
-    parser.add_argument("-k", "--kerberos", action="store_true",
-                        help="Use Kerberos auth (-k). Requires a valid ccache (KRB5CCNAME or /tmp/krb5cc_*).")
-    parser.add_argument("--combo",
-                        help="Path to a user:secret combo file. Auto-detects password vs NT/LM:NT hash per line.")
-    parser.add_argument("--null-session", action="store_true",
-                        help="Also probe null session, Guest:'', and anonymous:'' as fast quick-wins.")
-    parser.add_argument("-o", "--output", help="Custom log file path (default: HH-MM-SS-mmm.txt)")
-    parser.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS,
-                        help=f"Number of parallel threads (default: {DEFAULT_WORKERS})")
-    parser.add_argument(
-        "-m", "--mode",
-        type=parse_mode,
-        default="combination",
-        metavar="{combination,linear}",
-        help="Credential pairing mode: combination (all combinations) or linear (index-matched pairs).",
+
+    # ----- Targeting -----
+    g_target = parser.add_argument_group("target")
+    g_target.add_argument("-t", "--target", required=True,
+                          help="Target IP/hostname/CIDR, or path to a targets file (one per line).")
+
+    # ----- Credentials -----
+    g_auth = parser.add_argument_group(
+        "credentials",
+        "Provide credentials via -u + (-p OR -H), or --combo, or --null-session "
+        "(any of these alone is enough)."
     )
-    parser.add_argument(
-        "--nmap", action="store_true",
-        help="Pre-scan target ports with nmap and skip protocols whose ports are closed.",
+    g_auth.add_argument("-u", "--user",
+                        help="Username, or path to users.txt.")
+    g_auth.add_argument("-p", "--password",
+                        help="Password, or path to passwords.txt.")
+    g_auth.add_argument("-H", "--hash", dest="nthash",
+                        help="NT hash (32 hex), LM:NT (32:32 hex), or path to hashes.txt.")
+    g_auth.add_argument("-d", "--domain",
+                        help="Active Directory domain (added as -d <domain> to nxc).")
+    g_auth.add_argument("-k", "--kerberos", action="store_true",
+                        help="Use Kerberos auth (-k). Requires valid ccache via KRB5CCNAME.")
+    g_auth.add_argument("--combo",
+                        help="Combo file (user:secret per line). Auto-detects password vs NT/LM:NT hash.")
+    g_auth.add_argument("--null-session", action="store_true",
+                        help="Also probe null session + Guest:'' + anonymous:'' as cheap quick-wins.")
+    g_auth.add_argument("-m", "--mode", type=parse_mode, default="combination",
+                        metavar="{combination,linear}",
+                        help="Credential pairing: combination (cartesian, default) or linear (1-to-1).")
+
+    # ----- Pre-scan -----
+    g_scan = parser.add_argument_group("nmap pre-scan & cache")
+    g_scan.add_argument("--nmap", action="store_true",
+                        help="Pre-scan target ports with nmap; only spray protocols whose ports are open.")
+    g_scan.add_argument("--scan-only", action="store_true",
+                        help="Run nmap discovery only — no nxc attempts. Implies --nmap.")
+    g_scan.add_argument("--no-cache", action="store_true",
+                        help="Bypass the SQLite nmap-result cache.")
+    g_scan.add_argument("--cache-ttl", type=int, default=CACHE_DEFAULT_TTL,
+                        help=f"Cache TTL for nmap results in seconds (default: {CACHE_DEFAULT_TTL} = 24h).")
+
+    # ----- Post-exploitation -----
+    g_post = parser.add_argument_group("post-exploitation (runs only on valid creds)")
+    g_post.add_argument("--enum", action="store_true",
+                        help="Run --shares/--users/--sessions/--loggedon-users/--pass-pol into loot/.")
+    g_post.add_argument("--modules",
+                        help="Comma-separated nxc -M modules (e.g. spider_plus,gpp_password,lsassy).")
+    g_post.add_argument("--bloodhound", action="store_true",
+                        help="Auto-collect BloodHound (-c All --zip) per discovered AD domain.")
+    g_post.add_argument("--bloodhound-force", action="store_true",
+                        help="Re-collect BloodHound even if a recent successful run exists for the domain.")
+    g_post.add_argument("--bloodhound-ttl", type=int, default=CACHE_DEFAULT_TTL,
+                        help=f"Per-domain dedup window for BloodHound (default: {CACHE_DEFAULT_TTL} = 24h).")
+    g_post.add_argument("--loot-dir", default="loot",
+                        help="Root directory for enum/modules/bloodhound output (default: loot/).")
+
+    # ----- Performance / pacing -----
+    g_perf = parser.add_argument_group(
+        "performance & pacing",
+        "Use --low-power on weak VMs (3 workers, 1 retry, longer timeout, small delay). "
+        "Use --delay/--jitter for lockout-safe spraying."
     )
-    parser.add_argument(
-        "--no-cache", action="store_true",
-        help="Bypass the SQLite nmap-result cache (only relevant with --nmap).",
-    )
-    parser.add_argument(
-        "--cache-ttl", type=int, default=CACHE_DEFAULT_TTL,
-        help=f"Seconds nmap results remain valid in cache (default: {CACHE_DEFAULT_TTL} = 24h).",
-    )
-    parser.add_argument(
-        "--scan-only", action="store_true",
-        help="Run nmap discovery only and print open ports — no nxc auth attempts. Implies --nmap.",
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="count", default=0,
-        help="Increase verbosity: -v shows commands + failed auth lines, -vv adds raw nxc/nmap output.",
-    )
-    parser.add_argument(
-        "-q", "--quiet", action="store_true",
-        help="Only print valid credentials and post-exploit output. Suppresses banner and per-host detail.",
-    )
-    parser.add_argument(
-        "--enum", action="store_true",
-        help="On valid SMB cred, run --shares/--users/--sessions/--loggedon-users/--pass-pol into loot/.",
-    )
-    parser.add_argument(
-        "--modules",
-        help="Comma-separated nxc -M modules to run on valid SMB creds (e.g. spider_plus,gpp_password).",
-    )
-    parser.add_argument(
-        "--bloodhound", action="store_true",
-        help="Auto-collect BloodHound data per discovered AD domain (requires bloodhound-python).",
-    )
-    parser.add_argument(
-        "--bloodhound-force", action="store_true",
-        help="Re-collect BloodHound for a domain even if a recent successful run exists.",
-    )
-    parser.add_argument(
-        "--bloodhound-ttl", type=int, default=CACHE_DEFAULT_TTL,
-        help=f"Dedup window for BloodHound runs per domain (default: {CACHE_DEFAULT_TTL} = 24h).",
-    )
-    parser.add_argument(
-        "--loot-dir", default="loot",
-        help="Directory root for enum/modules/bloodhound output (default: loot/).",
-    )
-    parser.add_argument(
-        "--cmd-log",
-        help="Path for the shell-quoted commands transcript (default: commands-HH-MM-SS-mmm.log).",
-    )
-    parser.add_argument(
-        "--no-cmd-log", action="store_true",
-        help="Disable the commands transcript file.",
-    )
+    g_perf.add_argument("--low-power", action="store_true",
+                        help="Preset for VMs / weak hosts: workers=3, max-retry=1, timeouts ↑, small delay.")
+    g_perf.add_argument("-w", "--workers", type=int,
+                        help=f"Parallel threads (default: {DEFAULT_WORKERS}, low-power preset overrides).")
+    g_perf.add_argument("--delay", type=float, default=0.0,
+                        help="Seconds to sleep between credential attempts (per protocol task).")
+    g_perf.add_argument("--jitter", type=float, default=0.0,
+                        help="Random extra sleep (0..jitter) added to --delay for anti-lockout.")
+    g_perf.add_argument("--netexec-timeout", type=int, default=NETEXEC_TIMEOUT,
+                        help=f"Per-attempt nxc --timeout in seconds (default: {NETEXEC_TIMEOUT}).")
+    g_perf.add_argument("--subprocess-timeout", type=int, default=SUBPROCESS_TIMEOUT,
+                        help=f"Hard Python timeout per nxc invocation (default: {SUBPROCESS_TIMEOUT}).")
+    g_perf.add_argument("--max-retry", type=int, default=MAX_RETRY,
+                        help=f"Skip a protocol after N consecutive connectivity timeouts (default: {MAX_RETRY}).")
+
+    # ----- Output / logging -----
+    g_out = parser.add_argument_group("output & logging")
+    g_out.add_argument("-o", "--output",
+                       help="Custom nxc --log file path (default: HH-MM-SS-mmm.txt).")
+    g_out.add_argument("--cmd-log",
+                       help="Path for the shell-quoted commands transcript (default: commands-HH-MM-SS-mmm.log).")
+    g_out.add_argument("--no-cmd-log", action="store_true",
+                       help="Disable the commands transcript file.")
+    g_out.add_argument("-v", "--verbose", action="count", default=0,
+                       help="Increase verbosity: -v adds commands + [-] lines, -vv adds raw [*] info.")
+    g_out.add_argument("-q", "--quiet", action="store_true",
+                       help="Print only valid credentials. Suppresses banner and per-host detail.")
+
     return parser.parse_args()
+
+
+def _apply_low_power_defaults(args):
+    """Resolve --low-power into concrete values. Explicit user flags win."""
+    if not args.low_power:
+        return args
+    if args.workers is None:
+        args.workers = LOW_POWER_PROFILE["workers"]
+    if args.max_retry == MAX_RETRY:
+        args.max_retry = LOW_POWER_PROFILE["max_retry"]
+    if args.netexec_timeout == NETEXEC_TIMEOUT:
+        args.netexec_timeout = LOW_POWER_PROFILE["netexec_timeout"]
+    if args.subprocess_timeout == SUBPROCESS_TIMEOUT:
+        args.subprocess_timeout = LOW_POWER_PROFILE["subprocess_timeout"]
+    if args.delay == 0.0:
+        args.delay = LOW_POWER_PROFILE["delay"]
+    return args
 
 
 def main():
     args = parse_args()
+    args = _apply_low_power_defaults(args)
+    if args.workers is None:
+        args.workers = DEFAULT_WORKERS
     nmap_enabled = args.nmap or args.scan_only
     if args.quiet:
         verbosity = V_QUIET
@@ -1530,6 +1637,11 @@ def main():
             loot_dir=args.loot_dir,
             cmd_log=args.cmd_log,
             cmd_log_disabled=args.no_cmd_log,
+            delay=args.delay,
+            jitter=args.jitter,
+            netexec_timeout=args.netexec_timeout,
+            subprocess_timeout=args.subprocess_timeout,
+            max_retry=args.max_retry,
         )
         runner.run()
     except ValueError as exc:

@@ -1,0 +1,13 @@
+.git
+.gitignore
+.dockerignore
+dist/
+loot/
+*.log
+*.txt
+!requirements*.txt
+assets/
+scripts/
+__pycache__/
+*.pyc
+.cache/
