@@ -1531,6 +1531,42 @@ class NxcAutomator:
             if self.delay == 0:
                 print(f"    {YELLOW}→ consider --delay 60 --jitter 30 for the next run{RESET}")
 
+    @staticmethod
+    def _resolve_dc_via_dns(domain: str, timeout: int = 5) -> list[str]:
+        """Ask DNS for SRV _ldap._tcp.dc._msdcs.<domain> via dig or nslookup.
+        Returns a list of resolved DC hostnames/IPs (best-effort, may be empty)."""
+        query = f"_ldap._tcp.dc._msdcs.{domain}"
+        # dig prints lines like '0 100 389 dc01.corp.local.' (prio weight port target)
+        for tool, args in (
+            ("dig", ["+short", "+timeout=" + str(timeout), query, "SRV"]),
+            ("nslookup", ["-type=SRV", query]),
+        ):
+            if shutil.which(tool) is None:
+                continue
+            try:
+                result = subprocess.run([tool, *args], capture_output=True, text=True, timeout=timeout + 1)
+            except subprocess.TimeoutExpired:
+                continue
+            if result.returncode != 0:
+                continue
+            hosts: list[str] = []
+            for line in (result.stdout or "").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if tool == "dig":
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        hosts.append(parts[-1].rstrip("."))
+                else:  # nslookup
+                    if "svr hostname" in line.lower() or "service location" in line.lower():
+                        host = line.split("=")[-1].strip().rstrip(".")
+                        if host:
+                            hosts.append(host)
+            if hosts:
+                return hosts
+        return []
+
     def _pick_bloodhound_cred(self, domain: str) -> "Credential | None":
         """Choose a credential that successfully authenticated against this domain."""
         for entry in self.valid_creds:
@@ -1562,12 +1598,24 @@ class NxcAutomator:
                 print(f"     {DIM}→ {cached['output_path']}{RESET}")
                 continue
 
-            dcs = [h for h in hosts]  # all hosts that advertised this domain
-            if self.cache:
-                # Prefer DCs recorded with explicit source
+            # DC candidate sources, in order of preference:
+            # 1. DNS SRV (authoritative, when dig/nslookup are available)
+            # 2. SQLite cache (DCs identified in past or current runs)
+            # 3. Hosts that just advertised this domain in nxc's SMB banner
+            dcs: list[str] = []
+            dns_dcs = self._resolve_dc_via_dns(domain)
+            if dns_dcs:
+                dcs = dns_dcs
+                self._vprint(V_VERBOSE, f"  {DIM}🩸 DNS SRV → {len(dcs)} DC(s): {', '.join(dcs)}{RESET}")
+                if self.cache:
+                    for ip in dcs:
+                        self.cache.record_dc(domain, ip, "dns_srv")
+            elif self.cache:
                 dc_records = self.cache.get_dcs(domain)
                 if dc_records:
                     dcs = [ip for ip, _src in dc_records]
+            if not dcs:
+                dcs = list(hosts)
 
             if not dcs:
                 print(f"  {RED}✘ {domain}{RESET} {DIM}no DC candidate identified{RESET}")
@@ -1805,6 +1853,42 @@ def parse_mode(value: str) -> str:
     raise argparse.ArgumentTypeError("Mode must be one of: combination, linear")
 
 
+def _load_toml_config(path: str) -> dict:
+    """Read a TOML config and return a flat dict of CLI-overridable defaults.
+
+    Uses stdlib tomllib (3.11+) when available; falls back to a tiny line parser
+    that supports key=value/key="value"/key=true/key=N — enough for the simple
+    configs people actually write."""
+    try:
+        import tomllib
+        with open(path, "rb") as fh:
+            return tomllib.load(fh)
+    except ImportError:
+        pass
+    out: dict = {}
+    for raw in Path(path).read_text().splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        v = v.strip()
+        if v.startswith(("'", '"')) and v.endswith(v[0]):
+            v = v[1:-1]
+        elif v.lower() in ("true", "false"):
+            v = v.lower() == "true"
+        else:
+            try:
+                v = int(v)
+            except ValueError:
+                try:
+                    v = float(v)
+                except ValueError:
+                    pass
+        out[k] = v
+    return out
+
+
 EXAMPLES_EPILOG = """\
 examples:
   # 1. Single host, single credential — quickest possible run
@@ -1837,7 +1921,7 @@ examples:
 """
 
 
-def parse_args():
+def _build_parser():
     parser = argparse.ArgumentParser(
         description="Spray NetExec (nxc) across all 10 protocols in parallel — "
                     "with nmap pre-scan, hash/Kerberos auth, auto-enum, and BloodHound collection.",
@@ -1845,9 +1929,16 @@ def parse_args():
         epilog=EXAMPLES_EPILOG,
     )
 
+    # ----- Meta / one-shot operations -----
+    g_meta = parser.add_argument_group("meta")
+    g_meta.add_argument("--update-nxc", action="store_true",
+                        help="Install/update the official nxc binary via scripts/update-nxc.sh and exit.")
+    g_meta.add_argument("--config",
+                        help="Load defaults from a TOML config file (CLI flags still win).")
+
     # ----- Targeting -----
     g_target = parser.add_argument_group("target")
-    g_target.add_argument("-t", "--target", required=True,
+    g_target.add_argument("-t", "--target",
                           help="Target IP/hostname/CIDR, or path to a targets file (one per line).")
     g_target.add_argument("--only",
                           help="Comma-separated protocols to include (e.g. smb,ldap).")
@@ -1954,7 +2045,7 @@ def parse_args():
     g_out.add_argument("-q", "--quiet", action="store_true",
                        help="Print only valid credentials. Suppresses banner and per-host detail.")
 
-    return parser.parse_args()
+    return parser
 
 
 def _apply_low_power_defaults(args):
@@ -1974,8 +2065,41 @@ def _apply_low_power_defaults(args):
     return args
 
 
+def _merge_toml_into_args(args, parser):
+    """Overlay TOML values onto argparse defaults — CLI flags still win because
+    we only override values left at their argparse default."""
+    if not args.config:
+        return args
+    try:
+        cfg = _load_toml_config(args.config)
+    except Exception as exc:
+        raise SystemExit(f"{RED}Error reading --config {args.config}: {exc}{RESET}")
+    defaults = parser.parse_args([])  # what argparse would set with no CLI flags
+    for key, value in cfg.items():
+        key_attr = key.replace("-", "_")
+        if not hasattr(args, key_attr):
+            print(f"{YELLOW}⚠ --config: unknown key {key!r} (ignored){RESET}", file=sys.stderr)
+            continue
+        if getattr(args, key_attr) == getattr(defaults, key_attr, None):
+            setattr(args, key_attr, value)
+    return args
+
+
 def main():
-    args = parse_args()
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    if args.update_nxc:
+        script = Path(__file__).resolve().parent / "scripts" / "update-nxc.sh"
+        if not script.exists():
+            print(f"{RED}Error: {script} not found.{RESET}", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(subprocess.call(["bash", str(script)]))
+
+    if not args.target:
+        parser.error("-t/--target is required (or use --update-nxc to install the nxc binary).")
+
+    args = _merge_toml_into_args(args, parser)
     args = _apply_low_power_defaults(args)
     if args.workers is None:
         args.workers = DEFAULT_WORKERS
