@@ -446,7 +446,9 @@ class NmapScanner:
 
         results: dict[str, dict[int, str]] = {}
         for host in root.findall("host"):
-            addr_elem = host.find("address[@addrtype='ipv4']") or host.find("address")
+            addr_elem = host.find("address[@addrtype='ipv4']")
+            if addr_elem is None:
+                addr_elem = host.find("address")
             if addr_elem is None:
                 continue
             ip = addr_elem.get("addr")

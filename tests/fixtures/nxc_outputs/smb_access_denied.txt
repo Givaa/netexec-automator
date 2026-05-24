@@ -1,0 +1,2 @@
+SMB         10.10.10.7      445    WS01             [*] Windows 10.0 Build 19042 x64 (name:WS01) (domain:corp.local)
+SMB         10.10.10.7      445    WS01             [-] corp.local\bob:Password123 STATUS_ACCESS_DENIED
