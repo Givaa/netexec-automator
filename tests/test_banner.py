@@ -39,13 +39,34 @@ def test_banner_uses_box_drawing(nxa):
 
 
 def test_banner_rows_have_uniform_visible_width(nxa):
-    """All rendered rows must have the same visible (ANSI-stripped) length —
-    that's what keeps the right-hand border aligned."""
-    plain_lines = strip_ansi(nxa.render_startup_banner(width=72)).splitlines()
-    # Skip empty lines (shouldn't be any, but be defensive)
-    plain_lines = [l for l in plain_lines if l]
-    widths = {len(l) for l in plain_lines}
-    assert len(widths) == 1, f"rows have non-uniform widths: {sorted(widths)}\n" + "\n".join(plain_lines)
+    """All rendered rows must have the same *visible* (terminal-rendered)
+    width — that's what keeps the right-hand border aligned. Visible width
+    is ANSI-stripped AND accounts for wide emoji (⚡ 💀 ...) which Python
+    counts as 1 char but the terminal renders as 2 columns."""
+    from netexec_automator.banner import _visible_len
+    rendered_lines = nxa.render_startup_banner(width=72).splitlines()
+    rendered_lines = [l for l in rendered_lines if strip_ansi(l).strip() or "║" in strip_ansi(l)]
+    widths = {_visible_len(l) for l in rendered_lines}
+    assert len(widths) == 1, (
+        f"rows have non-uniform visible widths: {sorted(widths)}\n"
+        + "\n".join(rendered_lines)
+    )
+
+
+def test_visible_len_counts_wide_emoji_as_2(nxa):
+    """⚡ 💀 🩸 🧪 🔓 📋 are 2 cells wide in terminals; the helper must
+    reflect that or the box-drawing borders go off by one per emoji."""
+    from netexec_automator.banner import _visible_len
+    assert _visible_len("⚡") == 2
+    assert _visible_len("💀") == 2
+    assert _visible_len("⚡ NetExec") == 2 + 1 + 7  # emoji + space + 'NetExec'
+
+
+def test_visible_len_strips_ansi(nxa):
+    from netexec_automator.banner import _visible_len
+    plain = "hello"
+    colored = "\x1b[91m\x1b[1mhello\x1b[0m"
+    assert _visible_len(plain) == _visible_len(colored) == 5
 
 
 def test_no_banner_attr_propagates(nxa):

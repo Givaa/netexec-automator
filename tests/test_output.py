@@ -161,3 +161,37 @@ def test_format_host_tag_uses_resolver(nxa):
         tag = a._format_host_tag("10.10.10.5")
     assert "dc01.corp.local" in tag
     assert "10.10.10.5" in tag
+
+
+def test_format_host_tag_falls_back_to_smb_banner(nxa):
+    """When DNS PTR is empty, _format_host_tag should compose name+domain
+    from values learned during the spray (host_names + host_domain)."""
+    a = nxa.NxcAutomator(target="x", user="u", password="p")
+    # No PTR (gethostbyaddr raises)
+    import socket
+    a.host_names["10.10.10.5"] = "DC01"
+    a.host_domain["10.10.10.5"] = "corp.local"
+    with mock.patch("socket.gethostbyaddr", side_effect=socket.herror("no PTR")):
+        tag = a._format_host_tag("10.10.10.5")
+    assert "DC01.corp.local" in tag
+    assert "10.10.10.5" in tag
+
+
+def test_format_host_tag_uses_just_name_when_no_domain(nxa):
+    a = nxa.NxcAutomator(target="x", user="u", password="p")
+    a.host_names["10.10.10.7"] = "WS01"
+    # no host_domain entry
+    import socket
+    with mock.patch("socket.gethostbyaddr", side_effect=socket.herror("no PTR")):
+        tag = a._format_host_tag("10.10.10.7")
+    assert "WS01" in tag
+
+
+def test_detect_dc_extracts_name(nxa):
+    """SMB banner parsing should populate host_names alongside host_domain."""
+    a = nxa.NxcAutomator(target="x", user="u", password="p")
+    block = "SMB  10.10.10.5  445  DC01  [*] Windows Server 2019 ... (name:DC01) (domain:corp.local)"
+    results = {("smb", False): [block]}
+    a._detect_dc_from_results("10.10.10.5", results, open_ports={445, 389})
+    assert a.host_names["10.10.10.5"] == "DC01"
+    assert a.host_domain["10.10.10.5"] == "corp.local"

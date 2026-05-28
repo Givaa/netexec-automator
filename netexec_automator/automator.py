@@ -182,6 +182,7 @@ class NxcAutomator:
         self.valid_creds: list[dict] = []
         self.domain_hosts: dict[str, set[str]] = {}  # domain → {hostnames}
         self.host_domain: dict[str, str] = {}        # host → domain
+        self.host_names: dict[str, str] = {}         # host → NetBIOS name from SMB banner
         self.harvested_hashes: list[dict] = []       # auto-secretsdump output
         self.lockout_warnings: list[dict] = []       # detected pass-pol findings
         self.started_at = datetime.now()
@@ -946,19 +947,32 @@ class NxcAutomator:
         results: dict[TaskKey, list[str]],
         open_ports: set[int] | None,
     ):
-        """Scan SMB output blocks for (domain:...) info and combine with nmap port
-        signals to identify whether `host` is a Domain Controller."""
+        """Scan SMB output blocks for (domain:...) and (name:...) info, then
+        combine with nmap port signals to flag the host as a Domain Controller.
+        Side effect: populate self.host_names / self.host_domain so the FINAL
+        REPORT can show 'DC01.corp.local' next to the IP even when DNS PTR
+        has nothing for the host."""
         domain_found: str | None = None
+        name_found: str | None = None
         for (protocol, _local), blocks in results.items():
             if protocol != "smb":
                 continue
             for block in blocks:
-                m = SMB_DOMAIN_RE.search(block)
-                if m:
-                    domain_found = m.group(1).strip()
+                if domain_found is None:
+                    m = SMB_DOMAIN_RE.search(block)
+                    if m:
+                        domain_found = m.group(1).strip()
+                if name_found is None:
+                    m = SMB_NAME_RE.search(block)
+                    if m:
+                        name_found = m.group(1).strip()
+                if domain_found and name_found:
                     break
-            if domain_found:
+            if domain_found and name_found:
                 break
+
+        if name_found:
+            self.host_names[host] = name_found
 
         if not domain_found:
             return
@@ -1704,6 +1718,9 @@ class NxcAutomator:
                     tasks = self._build_protocol_tasks(open_ports if self.nmap_enabled else None)
 
                     if self.verbosity > V_QUIET:
+                        # Header tag uses PTR if available; the SMB-banner-derived
+                        # name lands here later (after the spray) but the FINAL
+                        # REPORT will pick it up via _format_host_tag.
                         hostname = self.resolver.resolve(host)
                         header = f"  {GREEN}{BOLD}► {host}{RESET}"
                         if hostname:
@@ -1738,8 +1755,8 @@ class NxcAutomator:
                     if host_valid:
                         self.valid_creds.extend(host_valid)
                         if self.verbosity == V_QUIET:
-                            hostname = self.resolver.resolve(host)
-                            host_tag = f"{host}" + (f" ({hostname})" if hostname else "")
+                            # PTR + SMB-banner-derived name (whichever resolves first)
+                            host_tag = self._format_host_tag(host)
                             for entry in host_valid:
                                 label = self._task_label(entry["protocol"], entry["local_auth"])
                                 if self._is_pwn3d(entry["raw"]):
@@ -1764,8 +1781,22 @@ class NxcAutomator:
             sys.exit(1)
 
     def _format_host_tag(self, host: str, width: int = 0) -> str:
-        """Render '10.10.10.5' or '10.10.10.5 (dc01.corp.local)' for the report."""
+        """Render '10.10.10.5' or '10.10.10.5 (DC01.corp.local)' for the report.
+
+        Resolution order:
+          1. Reverse-DNS PTR (works when the engagement network has DNS)
+          2. SMB banner: 'NAME' + 'domain' extracted by nxc during the spray
+             — works on AD networks even with no DNS infrastructure
+          3. Raw IP only
+        """
         hostname = self.resolver.resolve(host) if self.resolver else None
+        if not hostname:
+            name = self.host_names.get(host)
+            domain = self.host_domain.get(host)
+            if name and domain:
+                hostname = f"{name}.{domain}"
+            elif name:
+                hostname = name
         tag = f"{host} ({hostname})" if hostname else host
         return tag.ljust(width) if width else tag
 

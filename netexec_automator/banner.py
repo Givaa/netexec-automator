@@ -44,10 +44,10 @@ def render_startup_banner(width: int = 70) -> str:
       ┌─────────────────────────────────────────────────────────────────┐
       │                                                                 │
       │   <NXA block letters>    ⚡ NetExec Automator                    │
-      │                            auto-pwn AD in one command            │
+      │                            auto-pwn AD in one command           │
       │                                                                 │
-      │                            by Giovanni Rapa (@Givaa)             │
-      │                            github.com/Givaa/netexec-automator    │
+      │                            by Giovanni Rapa (@Givaa)            │
+      │                            github.com/Givaa/netexec-automator   │
       │                                                                 │
       │   "<quote>"                                                     │
       │       <attribution>                                             │
@@ -91,10 +91,30 @@ def render_startup_banner(width: int = 70) -> str:
     return "\n".join(lines)
 
 
+# Emoji we use as status icons or in the banner: terminals render each
+# of these as 2 columns wide, but Python's `len()` counts them as 1.
+# Listing them explicitly is more reliable than unicodedata for the few
+# symbols we actually print (some emoji are EAW='N' in Unicode but still
+# wide in every modern terminal).
+_FORCE_WIDE = set("⚡💀🩸🧪🔓📋💾⚠⏱")
+
+
 def _visible_len(s: str) -> int:
-    """Length of `s` ignoring ANSI escape sequences."""
+    """Length of `s` as the terminal will render it: ANSI escapes contribute
+    zero columns, wide emoji contribute two, everything else one."""
     import re
-    return len(re.sub(r"\x1b\[[0-9;]*m", "", s))
+    import unicodedata
+
+    s = re.sub(r"\x1b\[[0-9;]*m", "", s)
+    w = 0
+    for ch in s:
+        if ch in _FORCE_WIDE:
+            w += 2
+        elif unicodedata.east_asian_width(ch) in ("W", "F"):
+            w += 2
+        else:
+            w += 1
+    return w
 
 
 def _compose_row(block: str, meta: str, inner: int, block_color: str = "") -> str:
