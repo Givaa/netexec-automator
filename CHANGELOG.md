@@ -9,6 +9,46 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 
 ## [Unreleased]
 
+### Fixed — BloodHound + domain-wide LDAP enum
+- **`--bloodhound` now picks the most-privileged credential** discovered
+  during the spray, not whichever cred happened to validate first. The
+  old selector iterated `self.valid_creds` linearly and returned the
+  first domain-auth match — meaning a non-admin user often got picked
+  over an admin Pwn3d! on a different host of the same domain. New
+  helper `_pick_best_domain_cred(domain)` reuses `_pick_best_cred()`
+  so the (Pwn3d!) > domain-auth > password ranking is consistent with
+  the per-host post-exploit selector.
+- **BloodHound now receives the DC FQDN as `-dc`**, falling back to
+  the IP when the NetBIOS name isn't known. `-ns` stays as the IP
+  (bloodhound-python uses it as a nameserver for LDAP target lookups).
+  Fixes BloodHound collection on Kerberos-strict domains where the
+  ticket TGT lookup needs the hostname, not the IP.
+- **`bloodhound-python` -u value is now stripped of the `DOMAIN\\` prefix.**
+  Before, a credential captured as `corp\\administrator` was passed
+  verbatim and the tool errored out; now only the bare username is sent
+  (`administrator`), with `-d corp.local` carrying the domain.
+- **LDAP enum (`--enum --asreproast --kerberoasting` etc.) is now a
+  domain-wide pass at end-of-run**, not a per-host one. Before, the
+  enum used whichever cred validated on that single host — which often
+  meant running asreproast as a low-priv user when an admin was sitting
+  in `valid_creds` for another host on the same domain. Now
+  `_run_ldap_enum_pass()` iterates discovered domains, picks the best
+  cred across the entire run, queries the best DC for it, and writes
+  output to `loot/domain/<domain>/ldap/`.
+- The on-screen banner for both passes now surfaces the chosen cred
+  with a `(Pwn3d!)` or `(non-admin)` marker, so the operator can see
+  immediately whether the right account is being used:
+
+      🩸 BloodHound Collection
+      ▸ corp.local via DC01.corp.local (10.10.10.5) [smb_banner] as administrator (Pwn3d!)
+
+- 13 new pytest cases in `tests/test_bloodhound.py` covering: prefix
+  stripping (`corp\\admin` → `admin`), FQDN-preferred-over-IP for `-dc`
+  while `-ns` stays IP, hash auth path, `_pick_best_domain_cred` Pwn3d
+  priority, local-auth exclusion from domain creds, DNS-SRV > cache >
+  banner fallback chain in `_pick_dc_for_domain`, `_dc_fqdn` from
+  captured NetBIOS name. 153 → 166 total.
+
 ### Added — Incremental spray (`--skip-tried`)
 - **`--skip-tried`**: persist every (target, protocol, scope, user, secret)
   attempt to the SQLite cache and skip combinations seen in prior runs.

@@ -45,13 +45,33 @@ class BloodHoundRunner:
             return None
         return self.cache.recent_bloodhound(domain, self.ttl)
 
-    def build_cmd(self, domain: str, dc_ip: str, credential: Credential) -> list[str]:
+    @staticmethod
+    def _strip_domain_prefix(user: str) -> str:
+        """'corp\\admin' → 'admin'. bloodhound-python expects the bare username
+        and trips on 'DOMAIN\\user' input."""
+        if "\\" in user:
+            return user.rsplit("\\", 1)[-1]
+        return user
+
+    def build_cmd(
+        self,
+        domain: str,
+        dc_ip: str,
+        credential: Credential,
+        dc_host: str | None = None,
+    ) -> list[str]:
+        """Construct the bloodhound-python invocation.
+
+        -dc accepts a FQDN ('DC01.corp.local') OR an IP. FQDN is preferred
+        because LDAP+Kerberos lookups on the DC name only succeed with the
+        hostname, never with a bare IP. -ns should always be the IP — it's
+        the DNS resolver bloodhound-python uses to look up other hosts."""
         cmd = [
             "bloodhound-python",
             "-c", "All",
-            "-u", credential.user,
+            "-u", self._strip_domain_prefix(credential.user),
             "-d", domain,
-            "-dc", dc_ip,
+            "-dc", dc_host or dc_ip,
             "-ns", dc_ip,
             "--zip",
         ]
@@ -61,13 +81,19 @@ class BloodHoundRunner:
             cmd.extend(["-p", credential.password])
         return cmd
 
-    def collect(self, domain: str, dc_ip: str, credential: Credential) -> tuple[bool, Path, str]:
+    def collect(
+        self,
+        domain: str,
+        dc_ip: str,
+        credential: Credential,
+        dc_host: str | None = None,
+    ) -> tuple[bool, Path, str]:
         """Run bloodhound-python; returns (success, output_dir, last_stderr_line)."""
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_dir = self.loot.dir_for(
             "bloodhound", LootStore.safe_name(domain), ts
         )
-        cmd = self.build_cmd(domain, dc_ip, credential)
+        cmd = self.build_cmd(domain, dc_ip, credential, dc_host=dc_host)
         if self.log_cmd:
             self.log_cmd(f"bloodhound {domain}", cmd, dc_ip)
         last_err = ""
