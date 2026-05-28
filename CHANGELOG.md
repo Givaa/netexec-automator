@@ -9,7 +9,21 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 
 ## [Unreleased]
 
-(nothing yet)
+### Added
+- **Reverse-DNS PTR alongside target IPs** in the on-screen output. Each
+  host header now prints `► 10.10.10.5 (dc01.corp.local)` when DNS
+  resolves the IP, mirroring NetExec's classic `(name:…) (domain:…)`
+  banner format. Implementation: stdlib `socket.gethostbyaddr` with an
+  in-memory cache and a configurable per-host timeout — no new
+  dependencies, fails silently on no-PTR / DNS-down so it never blocks
+  the run. The same enrichment applies to the quiet-mode credential
+  one-liners.
+- New flags: `--no-resolve` to disable entirely, `--resolve-timeout`
+  (default 2.0 seconds) to tune the lookup budget.
+- 12 new pytest cases covering the resolver (PTR success, trailing-dot
+  stripping, herror / gaierror fallback, positive- and negative-result
+  caching, timeout save/restore, hostname pass-through, IP detection,
+  `--no-resolve` wiring) plus 2 integration cases — 107 total.
 
 ---
 

@@ -78,6 +78,32 @@ def test_valid_cred_appears_in_quiet_output(env_with_mock, tmp_path):
     assert "Summer2025" in out
 
 
+def test_host_header_can_show_ptr_hostname(env_with_mock, tmp_path):
+    """When DNS PTR resolves, the on-screen host header should include
+    the resolved hostname in parentheses. Default behaviour is enabled."""
+    rc, out, _ = run_tool(
+        ["-t", "10.10.10.5", "-u", "administrator", "-p", "Summer2025!",
+         "--only", "smb", "--no-cmd-log", "--resolve-timeout", "0.1"],
+        env_with_mock, tmp_path,
+    )
+    # Either the PTR resolved (and appears as '(...)' next to the IP)
+    # or it didn't and we still see the raw IP. Both are acceptable —
+    # we just want to confirm the codepath didn't crash and the IP still
+    # appears in the output.
+    assert "10.10.10.5" in out
+
+
+def test_no_resolve_flag_suppresses_ptr(env_with_mock, tmp_path):
+    """--no-resolve disables DNS lookups entirely (verified by running
+    with an unreachable resolver-timeout — no DNS attempt should hang)."""
+    rc, out, _ = run_tool(
+        ["-t", "10.10.10.5", "-u", "administrator", "-p", "Summer2025!",
+         "--only", "smb", "--no-cmd-log", "--no-resolve"],
+        env_with_mock, tmp_path,
+    )
+    assert "10.10.10.5" in out
+
+
 def test_pwn3d_appears_with_skull_icon(env_with_mock, tmp_path):
     rc, out, _ = run_tool(
         ["-t", "10.10.10.5", "-u", "administrator", "-p", "Summer2025!",

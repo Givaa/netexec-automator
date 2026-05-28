@@ -36,6 +36,7 @@ from .constants import (ALL_PROTOCOLS, AUTH_RESPONSE_PATTERNS, BANNER_WIDTH,
                         AttemptClassification, ParsedStatus, TaskKey)
 from .cracker import HashCracker
 from .loot import LootStore
+from .resolver import HostnameResolver
 from .scanner import NmapScanner
 from .types import Credential, NxcActionResult
 from ._utils import _term_width, _truncate_path
@@ -89,6 +90,8 @@ class NxcAutomator:
         crack_rules: str | None = None,
         crack_timeout: int = CRACK_DEFAULT_TIMEOUT,
         strict: bool = False,
+        resolve_enabled: bool = True,
+        resolve_timeout: float = 2.0,
     ):
         self.targets = self._read_value_or_file(target)
         self.mode = mode.lower()
@@ -168,6 +171,7 @@ class NxcAutomator:
         )
         self.cracked_creds: list[dict] = []  # post-crack (user, plain) records
         self.strict = strict
+        self.resolver = HostnameResolver(timeout=resolve_timeout, enabled=resolve_enabled)
         self.strict_errors: list[str] = []
 
         # Cross-host state populated during the run.
@@ -1586,7 +1590,10 @@ class NxcAutomator:
                     tasks = self._build_protocol_tasks(open_ports if self.nmap_enabled else None)
 
                     if self.verbosity > V_QUIET:
+                        hostname = self.resolver.resolve(host)
                         header = f"  {GREEN}{BOLD}► {host}{RESET}"
+                        if hostname:
+                            header += f" {DIM}({hostname}){RESET}"
                         if self.nmap_enabled:
                             header += f" {DIM}[{self._format_open_ports(open_ports)}]{RESET}"
                         print(header + "\n")
@@ -1617,12 +1624,14 @@ class NxcAutomator:
                     if host_valid:
                         self.valid_creds.extend(host_valid)
                         if self.verbosity == V_QUIET:
+                            hostname = self.resolver.resolve(host)
+                            host_tag = f"{host}" + (f" ({hostname})" if hostname else "")
                             for entry in host_valid:
                                 label = self._task_label(entry["protocol"], entry["local_auth"])
                                 if self._is_pwn3d(entry["raw"]):
-                                    print(f"  {RED}{BOLD}💀 {host}{RESET} {BOLD}{label:<20}{RESET} {RED}{entry['raw']}{RESET}")
+                                    print(f"  {RED}{BOLD}💀 {host_tag}{RESET} {BOLD}{label:<20}{RESET} {RED}{entry['raw']}{RESET}")
                                 else:
-                                    print(f"  {GREEN}► {host}{RESET} {BOLD}{label:<20}{RESET} {GREEN}{entry['raw']}{RESET}")
+                                    print(f"  {GREEN}► {host_tag}{RESET} {BOLD}{label:<20}{RESET} {GREEN}{entry['raw']}{RESET}")
                         self._post_exploit_host(host, host_valid)
 
             if self.bloodhound_enabled:

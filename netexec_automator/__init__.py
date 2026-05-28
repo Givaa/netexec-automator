@@ -37,6 +37,7 @@ from .bloodhound import BloodHoundRunner  # noqa: F401
 from .cache import HostCache  # noqa: F401
 from .cracker import HashCracker  # noqa: F401
 from .loot import LootStore  # noqa: F401
+from .resolver import HostnameResolver  # noqa: F401
 from .scanner import NmapScanner  # noqa: F401
 
 # Main runner + CLI

@@ -112,6 +112,10 @@ def _build_parser():
                           help="Comma-separated protocols to include (e.g. smb,ldap).")
     g_target.add_argument("--exclude",
                           help="Comma-separated protocols to exclude (e.g. vnc,rdp,nfs).")
+    g_target.add_argument("--no-resolve", action="store_true",
+                          help="Disable reverse-DNS PTR lookup for target IPs in the on-screen output.")
+    g_target.add_argument("--resolve-timeout", type=float, default=2.0,
+                          help="Per-host DNS PTR lookup timeout in seconds (default: 2.0).")
 
     # ----- Credentials -----
     g_auth = parser.add_argument_group(
@@ -348,6 +352,8 @@ def main():
             crack_rules=args.crack_rules,
             crack_timeout=args.crack_timeout,
             strict=args.strict,
+            resolve_enabled=not args.no_resolve,
+            resolve_timeout=args.resolve_timeout,
         )
         runner.run()
     except ValueError as exc:

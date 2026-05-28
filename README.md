@@ -89,6 +89,7 @@ python3 netexec-automator.py -t 10.10.10.0/24 -u x -p x --scan-only
 | **Pacing** | `--low-power` preset for weak VMs; `--delay` + `--jitter` for lockout-safe spraying |
 | **Cracking** | `--crack` runs hashcat (or john) on harvested NT (SAM/LSA/NTDS) and Kerberos (AS-REP/TGS-REP) hashes; cracked plaintexts are auto-appended to the grow-combo for the next spray |
 | **Output** | Live `[+]` highlights, per-host summary, `-q` for creds-only, `-v`/`-vv` for full debug |
+| **DNS PTR** | Each target IP is shown alongside its reverse-DNS hostname when resolvable (`► 10.10.10.5 (dc01.corp.local)`); disable with `--no-resolve` |
 
 ---
 
@@ -383,6 +384,8 @@ Most-used flags at a glance:
 | Flag | Default | What it does |
 |------|---------|-------------|
 | `-t, --target` | *(required)* | IP/hostname/CIDR or path to a targets file |
+| `--no-resolve` | off | Skip reverse-DNS PTR lookup of target IPs in the on-screen output |
+| `--resolve-timeout` | `2.0` | Per-host DNS PTR lookup timeout in seconds |
 | `-u, --user` | — | Username or path to users file |
 | `-p, --password` | — | Password or path to passwords file |
 | `-H, --hash` | — | NT or LM:NT hash, single or file |
