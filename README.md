@@ -327,6 +327,56 @@ Override the path with `--cmd-log /path/to/file`. Disable with `--no-cmd-log`.
 
 ---
 
+## Output layout
+
+The default is built around what an operator actually wants to see at a glance:
+
+```
+  ► 10.10.10.5 (dc01.corp.local) [SMB, LDAP, RDP]
+
+  💀 PWN3D! SMB (domain) corp.local\administrator:Summer2025! (Pwn3d!)
+
+  💀 SMB (domain), SMB (local)
+  ✘ LDAP (domain), RDP (domain)
+
+  …other hosts…
+
+════════════════════════════════════════════════════════════════════════
+  📋 FINAL REPORT
+════════════════════════════════════════════════════════════════════════
+
+  💀 ADMIN PWN3D (1)
+     10.10.10.5 (dc01.corp.local)  →  SMB (domain)    corp.local\administrator:Summer2025! (Pwn3d!)
+
+  ⚡ VALID CREDENTIALS (2)
+     10.10.10.7 (ws01.corp.local)  →  SMB (local)     WORKGROUP\svc_backup:Welcome1
+     10.10.10.8 (linux01)          →  SSH (domain)    bob:Password1
+
+  🧪 HASHES HARVESTED
+     12× NT (SAM/LSA/NTDS) → loot/auto-grown-creds.txt
+     3× Kerberos (AS-REP / TGS-REP)
+
+  🔓 CRACKED PLAINTEXT (4)
+     Administrator:Summer2025!  (nt-crack)
+     svc_backup:Welcome1        (nt-crack)
+     alice:Spring2024!          (asreproast-crack)
+
+  🩸 BLOODHOUND (1 domain)
+     corp.local  via 10.10.10.5 → loot/bloodhound/corp.local/20260524-220015/
+
+  ⊘ NO RESPONSE (3)
+     10.10.10.1, 10.10.10.2, 10.10.10.3
+```
+
+Sections appear only when non-empty. The whole **FINAL REPORT** is suppressed in `-q` (which keeps the output to a one-cred-per-line stream).
+
+| Verbosity | What you get |
+|-----------|--------------|
+| `-q` | Only valid credentials, one per line — pipe-friendly |
+| *(default)* | Banner + run summary + per-host one-line recap (💀/⚡/⏱/✘) + FINAL REPORT |
+| `-v` | + per-host detailed per-protocol block (every `[+]`/`[-]`/`[!]`), nxc commands logged, cache hit/miss, DC detection, failed-auth lines |
+| `-vv` | + raw `[*]` info lines, nmap raw stats |
+
 ## Status icons & error handling
 
 Every post-exploit and live action uses one of these icons; the meaning is **stable** across the whole tool:

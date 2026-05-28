@@ -171,6 +171,8 @@ class NxcAutomator:
             if crack_enabled else None
         )
         self.cracked_creds: list[dict] = []  # post-crack (user, plain) records
+        self.dead_hosts: list[str] = []      # targets with no open port / unreachable
+        self.bloodhound_results: list[dict] = []  # domain, dc_ip, path, success (for final report)
         self.strict = strict
         self.resolver = HostnameResolver(timeout=resolve_timeout, enabled=resolve_enabled)
         self.no_banner = no_banner
@@ -813,18 +815,88 @@ class NxcAutomator:
         return results
 
     def _print_target_results(self, results: dict[TaskKey, list[str]], tasks: list[TaskKey]):
+        """Dispatcher: concise per-host recap in default, full per-protocol
+        block when -v or -vv is on. The aggregate FINAL REPORT prints once
+        at the end of the run (see _print_final_report)."""
+        if self.verbosity >= V_VERBOSE:
+            self._print_target_results_verbose(results, tasks)
+        else:
+            self._print_target_results_recap(results, tasks)
+
+    def _classify_task_outcome(self, parsed: list["ParsedStatus"]) -> str:
+        """Map a list of parsed nxc status lines to a single outcome bucket.
+
+        Buckets (most-significant first):
+          'pwn3d'   → [+] with (Pwn3d!)
+          'ok'      → [+] without Pwn3d
+          'timeout' → [!] (connectivity issue / consecutive timeouts)
+          'fail'    → [-] (auth rejected)
+          'noop'    → nothing actionable (dead/no output)
+        """
+        if any(m == "[+]" and self._is_pwn3d(msg) for m, msg in parsed):
+            return "pwn3d"
+        if any(m == "[+]" for m, _ in parsed):
+            return "ok"
+        if any(m == "[!]" for m, _ in parsed):
+            return "timeout"
+        if any(m == "[-]" for m, _ in parsed):
+            return "fail"
+        return "noop"
+
+    def _print_target_results_recap(self, results: dict[TaskKey, list[str]], tasks: list[TaskKey]):
+        """One-line per-host recap grouped by outcome. The actual [+] credential
+        lines were already printed live by _report_success_lines, so we don't
+        repeat them here — we just summarise which protocols did what."""
+        groups: dict[str, list[str]] = {"pwn3d": [], "ok": [], "timeout": [], "fail": [], "noop": []}
+
+        for protocol, local_auth in tasks:
+            key = (protocol, local_auth)
+            blocks = results.get(key, [])
+            parsed = self._parse_status_blocks(blocks)
+            outcome = self._classify_task_outcome(parsed)
+            groups[outcome].append(self._task_label(protocol, local_auth))
+
+        # Print only buckets that have content (skip empty ones for compactness)
+        printed = False
+        for icon, key, color, dim in [
+            (ICON_PWN3D,    "pwn3d",   RED,    False),
+            (ICON_FINDING,  "ok",      GREEN,  False),
+            (ICON_TIMEOUT,  "timeout", YELLOW, True),
+            (ICON_FAIL,     "fail",    RED,    True),
+        ]:
+            items = groups[key]
+            if not items:
+                continue
+            joined = ", ".join(items)
+            line = f"  {icon} {DIM if dim else ''}{joined}{RESET}"
+            print(line)
+            printed = True
+
+        # 'noop' is the most common — show it only as a quiet trailing summary
+        if groups["noop"] and not printed:
+            # Whole host had nothing actionable — say so plainly
+            names = ", ".join(groups["noop"])
+            print(f"  {DIM}— no response on: {names}{RESET}")
+        elif groups["noop"]:
+            # Mixed run: collapse the no-output protocols into one dim line
+            count = len(groups["noop"])
+            print(f"  {DIM}+ {count} other protocol(s) with no response{RESET}")
+        print()
+
+    def _print_target_results_verbose(self, results: dict[TaskKey, list[str]], tasks: list[TaskKey]):
+        """Original full per-protocol breakdown — promoted to -v / -vv. The
+        FINAL REPORT at end-of-run replaces the old per-host 'VALID
+        CREDENTIALS' / 'ADMIN PWN3D' summary blocks."""
         target_info = self._extract_target_info(results)
 
-        print(f"\n{'─' * BANNER_WIDTH}")
-        print(f"  {CYAN}{BOLD}📋 NetExec Automator Results{RESET}")
-        print(f"{'─' * BANNER_WIDTH}")
+        print(f"\n{DIM}{'─' * BANNER_WIDTH}{RESET}")
+        print(f"  {CYAN}{BOLD}📋 Detailed Results{RESET}")
+        print(f"{DIM}{'─' * BANNER_WIDTH}{RESET}")
 
         if target_info:
             print(f"    {DIM}{target_info}{RESET}")
         print()
 
-        successes: list[tuple[str, str]] = []
-        # Track no-response by protocol name so domain/local variants collapse into one line.
         no_output_protos: set[str] = set()
 
         for protocol, local_auth in tasks:
@@ -836,15 +908,12 @@ class NxcAutomator:
                 no_output_protos.add(protocol.upper())
                 continue
 
-            # Keep only user-facing status lines from raw nxc output.
             parsed = self._parse_status_blocks(blocks)
-
             if not parsed:
                 no_output_protos.add(protocol.upper())
                 continue
 
             icon = self._status_icon(parsed)
-
             for i, (marker, msg) in enumerate(parsed):
                 if i == 0:
                     prefix = f"  {icon} {BOLD}{label:<20}{RESET}"
@@ -856,7 +925,6 @@ class NxcAutomator:
                         print(f"{prefix} {RED}{BOLD}💀 {msg}{RESET}")
                     else:
                         print(f"{prefix} {GREEN}{msg}{RESET}")
-                    successes.append((label, msg))
                 elif marker == "[-]":
                     print(f"{prefix} {DIM}{msg}{RESET}")
                 elif marker == "[!]":
@@ -864,26 +932,9 @@ class NxcAutomator:
 
         if no_output_protos:
             ordered = [p for p in ALL_PROTOCOLS if p.upper() in no_output_protos]
-            names = ", ".join(p.upper() for p in ordered)
+            names = ", ".join(ordered)
             print(f"\n  {DIM}── No response: {names}{RESET}")
-
-        print(f"\n{'─' * BANNER_WIDTH}")
-
-        if successes:
-            pwn3d_hits = [s for s in successes if self._is_pwn3d(s[1])]
-            if pwn3d_hits:
-                print(f"\n  {RED}{BOLD}💀 ADMIN PWN3D ({len(pwn3d_hits)}){RESET}\n")
-                for label, msg in pwn3d_hits:
-                    print(f"    {RED}{BOLD}►{RESET} {BOLD}{label:<20}{RESET} {DIM}│{RESET} {RED}{msg}{RESET}")
-            print(f"\n  {GREEN}{BOLD}✓ VALID CREDENTIALS{RESET}\n")
-            for label, msg in successes:
-                icon = f"{RED}{BOLD}►{RESET}" if self._is_pwn3d(msg) else f"{GREEN}►{RESET}"
-                print(f"    {icon} {BOLD}{label:<20}{RESET} {DIM}│{RESET} {msg}")
-            print()
-        else:
-            print(f"\n  {RED}{BOLD}✗ No valid credentials found.{RESET}\n")
-
-        print(f"{'═' * BANNER_WIDTH}\n")
+        print()
 
     # ---------------------------------------------------------------
     # Post-exploitation: DC detection, enum/modules, BloodHound
@@ -1480,6 +1531,10 @@ class NxcAutomator:
             dc_ip = dcs[0]
             print(f"  {ICON_SUBTASK} {domain} {DIM}via {dc_ip} as {cred.user}{RESET}")
             success, out_dir, err = self.bloodhound_runner.collect(domain, dc_ip, cred)
+            self.bloodhound_results.append({
+                "domain": domain, "dc_ip": dc_ip, "auth_user": cred.user,
+                "output_path": str(out_dir), "success": success, "error": err,
+            })
             if success:
                 print(f"    {ICON_OK} collected {DIM}→ {_truncate_path(out_dir)}{RESET}")
             else:
@@ -1640,6 +1695,7 @@ class NxcAutomator:
 
                 if not discovered:
                     msg = "no open ports / unreachable" if self.nmap_enabled else "no targets"
+                    self.dead_hosts.append(raw_target)
                     if self.verbosity > V_QUIET:
                         print(f"  {DIM}► {raw_target} — {msg}{RESET}\n")
                     continue
@@ -1698,6 +1754,7 @@ class NxcAutomator:
             if self.export_json_path or self.export_csv_path:
                 self._write_exports()
 
+            self._print_final_report()
             self._print_run_diagnostics()
         finally:
             if self.cache:
@@ -1705,6 +1762,92 @@ class NxcAutomator:
 
         if self.strict and self.strict_errors:
             sys.exit(1)
+
+    def _format_host_tag(self, host: str, width: int = 0) -> str:
+        """Render '10.10.10.5' or '10.10.10.5 (dc01.corp.local)' for the report."""
+        hostname = self.resolver.resolve(host) if self.resolver else None
+        tag = f"{host} ({hostname})" if hostname else host
+        return tag.ljust(width) if width else tag
+
+    def _print_final_report(self):
+        """Aggregate end-of-run report grouping every interesting outcome
+        (admin pwns, valid creds, harvested hashes, cracked plaintexts,
+        BloodHound collections, dead hosts) into one scannable block.
+
+        Suppressed in quiet (-q); always shown otherwise."""
+        if self.verbosity <= V_QUIET:
+            return
+
+        pwn3d = [v for v in self.valid_creds if self._is_pwn3d(v["raw"])]
+        others = [v for v in self.valid_creds if not self._is_pwn3d(v["raw"])]
+        cracked = list(self.cracked_creds)
+        nt_count = sum(1 for h in self.harvested_hashes if h.get("nt"))
+        krb_count = sum(h.get("count", 0) for h in self.harvested_hashes if "kerberos_file" in h)
+        bh_ok = [b for b in self.bloodhound_results if b.get("success")]
+
+        # Compute a sensible host-column width across all rows that will be printed
+        cred_hosts = [self._format_host_tag(v["host"]) for v in self.valid_creds]
+        host_w = min(40, max((len(h) for h in cred_hosts), default=18))
+
+        print(f"\n{BOLD}{CYAN}{'═' * 72}{RESET}")
+        print(f"  {CYAN}{BOLD}📋 FINAL REPORT{RESET}")
+        print(f"{BOLD}{CYAN}{'═' * 72}{RESET}\n")
+
+        if pwn3d:
+            print(f"  {ICON_PWN3D} {RED}{BOLD}ADMIN PWN3D ({len(pwn3d)}){RESET}")
+            for v in pwn3d:
+                label = self._task_label(v["protocol"], v["local_auth"])
+                tag = self._format_host_tag(v["host"], host_w)
+                print(f"     {RED}{tag}{RESET} {DIM}→{RESET} {BOLD}{label:<15}{RESET} {RED}{v['raw']}{RESET}")
+            print()
+
+        if others:
+            print(f"  {ICON_FINDING} {GREEN}{BOLD}VALID CREDENTIALS ({len(others)}){RESET}")
+            for v in others:
+                label = self._task_label(v["protocol"], v["local_auth"])
+                tag = self._format_host_tag(v["host"], host_w)
+                print(f"     {GREEN}{tag}{RESET} {DIM}→{RESET} {BOLD}{label:<15}{RESET} {GREEN}{v['raw']}{RESET}")
+            print()
+
+        if nt_count or krb_count:
+            print(f"  {ICON_HARVEST} {GREEN}{BOLD}HASHES HARVESTED{RESET}")
+            if nt_count:
+                grow = self._effective_grow_combo()
+                print(f"     {GREEN}{nt_count}× NT (SAM/LSA/NTDS){RESET} {DIM}→ {_truncate_path(grow)}{RESET}")
+            if krb_count:
+                print(f"     {GREEN}{krb_count}× Kerberos (AS-REP / TGS-REP){RESET}")
+            print()
+
+        if cracked:
+            print(f"  {ICON_CRACK} {CYAN}{BOLD}CRACKED PLAINTEXT ({len(cracked)}){RESET}")
+            for c in cracked:
+                src = c.get("source", "?")
+                print(f"     {GREEN}{c['user']}:{c['password']}{RESET} {DIM}({src}){RESET}")
+            print()
+
+        if bh_ok:
+            print(f"  {ICON_BLOODHOUND} {CYAN}{BOLD}BLOODHOUND ({len(bh_ok)} domain{'s' if len(bh_ok) != 1 else ''}){RESET}")
+            for b in bh_ok:
+                print(f"     {CYAN}{b['domain']}{RESET} {DIM}via {b['dc_ip']} → {_truncate_path(b['output_path'])}{RESET}")
+            print()
+
+        if self.dead_hosts:
+            shown = self.dead_hosts[:10]
+            extra = len(self.dead_hosts) - len(shown)
+            tail = f" (+{extra} more)" if extra > 0 else ""
+            print(f"  {ICON_NOOP} {YELLOW}{BOLD}NO RESPONSE ({len(self.dead_hosts)}){RESET}")
+            print(f"     {DIM}{', '.join(shown)}{tail}{RESET}")
+            print()
+
+        # Bottom line: if literally nothing happened, say so plainly.
+        if not (pwn3d or others or cracked or nt_count or krb_count or bh_ok):
+            if self.dead_hosts:
+                msg = f"only {len(self.dead_hosts)} host(s) probed — all unreachable / no auth attempts produced findings"
+            else:
+                msg = "no valid credentials found"
+            print(f"  {RED}{BOLD}✘ {msg}.{RESET}\n")
+
+        print(f"{BOLD}{CYAN}{'═' * 72}{RESET}\n")
 
     def _print_run_diagnostics(self):
         """End-of-run summary of errors collected during the spray.

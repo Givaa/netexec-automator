@@ -9,6 +9,40 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 
 ## [Unreleased]
 
+### Changed — Output redesigned (default is now concise)
+- The default verbosity used to dump every single nxc auth attempt
+  per protocol per host — useful for debugging, noisy in practice. The
+  output has been rethought around what the operator actually wants to
+  see at a glance:
+  - **`-q`** (unchanged): only valid credentials, one per line.
+  - **default** (new): per-host **one-line recap grouped by outcome**
+    (💀 admin / ⚡ valid / ⏱ timeouts / ✘ rejected), followed by a
+    single **FINAL REPORT** at end-of-run that aggregates everything.
+  - **`-v`** (new): everything in default, **plus** the original
+    per-protocol verbose breakdown ("Detailed Results") with every
+    `[+]`/`[-]`/`[!]` line. Plus the existing -v stuff (commands log,
+    cache hit/miss, DC detection, failed-auth lines).
+  - **`-vv`** (unchanged): + raw `[*]` info, raw nmap output.
+- The end-of-run **FINAL REPORT** is the centrepiece. Sections shown
+  only when non-empty:
+    - 💀 `ADMIN PWN3D (N)` — host → protocol → cred (raw nxc [+] line)
+    - ⚡ `VALID CREDENTIALS (N)` — non-pwn3d successes
+    - 🧪 `HASHES HARVESTED` — counts of NT (SAM/LSA/NTDS) and Kerberos
+      hashes plus pointer to the grow-combo file
+    - 🔓 `CRACKED PLAINTEXT (N)` — user:password recovered by hashcat
+    - 🩸 `BLOODHOUND (N domains)` — collected zips with paths
+    - ⊘ `NO RESPONSE (N)` — dead / unreachable targets (capped at 10
+      shown, plus a "+N more" tail)
+    - `✘ no valid credentials found` if literally nothing landed.
+- Hostnames from the PTR resolver are inlined in the report
+  (`10.10.10.5 (dc01.corp.local)`) for readability.
+- New per-instance tracking: `self.dead_hosts` (populated when a target
+  has no open ports / is unreachable) and `self.bloodhound_results`
+  (populated during `_run_bloodhound_pass`).
+- 15 new pytest cases in `tests/test_output.py` covering the outcome
+  classifier matrix, recap grouping, --no-banner / -v output paths, all
+  FINAL REPORT sections, and quiet-mode suppression — 130 total.
+
 ### Added
 - **Decorative startup banner** with NXA block-letter ASCII art (sliver-style),
   credits to Giovanni Rapa (@Givaa) + GitHub URL, and a random quote drawn
