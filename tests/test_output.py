@@ -187,6 +187,51 @@ def test_format_host_tag_uses_just_name_when_no_domain(nxa):
     assert "WS01" in tag
 
 
+def test_probe_smb_banner_populates_host_names(nxa):
+    """The pre-spray SMB probe should fill host_names + host_domain so the
+    live ► header can show 'IP (DC01.corp.local)' from the very first line."""
+    import subprocess as sp
+    a = nxa.NxcAutomator(target="x", user="u", password="p")
+    banner = (
+        "SMB  10.10.10.5  445  DC01  [*] Windows Server 2019 ... "
+        "(name:DC01) (domain:corp.local)"
+    )
+    fake_result = mock.Mock(returncode=0, stdout=banner, stderr="")
+    with mock.patch.object(sp, "run", return_value=fake_result):
+        a._probe_smb_banner("10.10.10.5")
+    assert a.host_names["10.10.10.5"] == "DC01"
+    assert a.host_domain["10.10.10.5"] == "corp.local"
+
+
+def test_probe_smb_banner_skips_when_smb_port_closed(nxa):
+    """If nmap pre-scan says SMB ports are closed, the probe shouldn't
+    even spawn a subprocess (we'd just get a timeout)."""
+    import subprocess as sp
+    a = nxa.NxcAutomator(target="x", user="u", password="p")
+    with mock.patch.object(sp, "run") as run_mock:
+        a._probe_smb_banner("10.10.10.5", open_ports={22, 80})
+    run_mock.assert_not_called()
+
+
+def test_probe_smb_banner_skips_when_already_known(nxa):
+    """Cached host_names/host_domain → no probe needed."""
+    import subprocess as sp
+    a = nxa.NxcAutomator(target="x", user="u", password="p")
+    a.host_names["10.10.10.5"] = "DC01"
+    a.host_domain["10.10.10.5"] = "corp.local"
+    with mock.patch.object(sp, "run") as run_mock:
+        a._probe_smb_banner("10.10.10.5")
+    run_mock.assert_not_called()
+
+
+def test_resolved_hostname_prefers_ptr_over_smb_banner(nxa):
+    a = nxa.NxcAutomator(target="x", user="u", password="p")
+    a.host_names["10.10.10.5"] = "DC01"
+    a.host_domain["10.10.10.5"] = "corp.local"
+    with mock.patch("socket.gethostbyaddr", return_value=("dc-via-dns.corp.local", [], ["10.10.10.5"])):
+        assert a._resolved_hostname("10.10.10.5") == "dc-via-dns.corp.local"
+
+
 def test_detect_dc_extracts_name(nxa):
     """SMB banner parsing should populate host_names alongside host_domain."""
     a = nxa.NxcAutomator(target="x", user="u", password="p")

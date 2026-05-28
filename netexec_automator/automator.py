@@ -679,11 +679,18 @@ class NxcAutomator:
 
     # ---- banner rendering -------------------------------------------------
 
-    # Column widths for the run-summary table. Stable padding makes the
-    # banner read like a tidy spec-sheet instead of the previous staircase.
+    # The decorative banner is exactly _BANNER_WIDTH columns wide. The
+    # run-summary table beneath it is padded to the same width so the two
+    # blocks read as one coherent header instead of two stacked rectangles
+    # of different sizes.
+    _BANNER_WIDTH = 72
+    # 2-column row layout (one row total = 72 cols):
+    #   2 lead spaces + KEY1 + " │ " + VAL1 + " │ " + KEY2 + " │ " + VAL2
+    #     = 2 + 13 + 3 + 19 + 3 + 11 + 3 + 18 = 72
     _CFG_KEY_W = 13
-    _CFG_VAL_W = 20
+    _CFG_VAL_W = 19
     _CFG_KEY2_W = 11
+    _CFG_VAL2_W = 18
 
     def _print_scan_banner(self, total_attempts: int):
         from .banner import render_startup_banner
@@ -692,34 +699,37 @@ class NxcAutomator:
         # entirely by --no-banner or in --quiet mode.
         if not self.no_banner:
             print()
-            print(render_startup_banner(width=72))
+            print(render_startup_banner(width=self._BANNER_WIDTH))
             print()
 
         nmap_status = "ON" if self.nmap_enabled else "OFF"
         cache_status = "ON" if self.cache else ("OFF" if (self.nmap_enabled or self.bloodhound_enabled) else "n/a")
         verbosity_label = {V_DEBUG: "DEBUG", V_VERBOSE: "VERBOSE", V_NORMAL: "NORMAL", V_QUIET: "QUIET"}.get(self.verbosity, "NORMAL")
-        cmd_log_str = _truncate_path(self.cmd_log_path) if self.cmd_log_path else "disabled"
+        # Truncate paths to whatever the cell budgets allow so the right border doesn't slip.
+        cmd_log_str = _truncate_path(self.cmd_log_path, budget=self._CFG_VAL_W) if self.cmd_log_path else "disabled"
         resolve_str = "ON" if self.resolver.enabled else "OFF"
+        loot_str = _truncate_path(self.loot.root, budget=self._CFG_VAL_W)
+        log_str = _truncate_path(self.log_file, budget=self._CFG_VAL2_W)
 
         # Build the 2-column rows. Each is (key1, val1, key2, val2). Use
         # None for key2 to span the whole row.
         rows: list[tuple[str, str, str | None, str | None]] = [
             ("Targets",      str(len(self.targets)),           "Protocols",   f"{len(ALL_PROTOCOLS)} (+local auth)"),
             ("Credentials",  str(len(self.credentials)),       "Workers",     str(self.workers)),
-            ("Composition",  self._credential_summary(),       "Mode",        self.mode.upper()),
+            ("Composition",  self._credential_summary(),       None,          None),  # may be long → full row
             ("Auth opts",    self._auth_options_summary(),     "DNS PTR",     resolve_str),
             ("Pre-scan",     nmap_status,                      "Cache",       cache_status),
             ("Post-exploit", self._post_exploit_summary(),     "Verbosity",   verbosity_label),
-            ("Loot dir",     _truncate_path(self.loot.root),   "Log file",    _truncate_path(self.log_file)),
-            ("Cmd log",      cmd_log_str,                      None,           None),
+            ("Loot dir",     loot_str,                         "Log file",    log_str),
+            ("Cmd log",      cmd_log_str,                      "Mode",        self.mode.upper()),
         ]
 
         pacing = self._pacing_summary()
         if pacing:
-            rows.append(("Pacing",   pacing, None, None))
+            rows.append(("Pacing", pacing, None, None))
         filters_summary = self._filters_summary()
         if filters_summary:
-            rows.append(("Filters",  filters_summary, None, None))
+            rows.append(("Filters", filters_summary, None, None))
         if self.crack_enabled and self.cracker:
             wl = self.cracker.find_wordlist()
             wl_str = _truncate_path(wl) if wl else "missing"
@@ -728,8 +738,8 @@ class NxcAutomator:
                 crack_str += f" · rules={Path(self.cracker.rules).name}"
             rows.append(("Cracking", crack_str, None, None))
 
-        # Render header bar
-        bar = "─" * (self._CFG_KEY_W + self._CFG_VAL_W + self._CFG_KEY2_W + 12)
+        # Header / footer bar at the same width as the decorative banner.
+        bar = "─" * self._BANNER_WIDTH
         print(f"{DIM}{bar}{RESET}")
         for k1, v1, k2, v2 in rows:
             print(self._cfg_row(k1, v1, k2, v2))
@@ -744,16 +754,30 @@ class NxcAutomator:
             print(f"  {DIM}Total tasks queued:{RESET} {BOLD}{label}{RESET}{note}")
         print()
 
+    @staticmethod
+    def _pad_visible(s: str, width: int) -> str:
+        """Like str.ljust but uses _visible_len so emoji and ANSI don't
+        miscount columns."""
+        from .banner import _visible_len
+        pad = max(0, width - _visible_len(s))
+        return s + " " * pad
+
     def _cfg_row(self, k1: str, v1: str, k2: str | None, v2: str | None) -> str:
-        """Format one 2-column banner row with consistent padding."""
-        key_pad = self._CFG_KEY_W
-        val_pad = self._CFG_VAL_W
-        key2_pad = self._CFG_KEY2_W
+        """Render one config-table row, padded so the right edge lands at
+        exactly _BANNER_WIDTH columns regardless of wide-emoji or ANSI."""
+        # Total budget for a single-column row's value:
+        #   inner = _BANNER_WIDTH - 2 (lead) - KEY_W - 3 (" │ ")
         if k2 is None:
-            return f"  {k1:<{key_pad}} {DIM}│{RESET} {BOLD}{v1}{RESET}"
+            v1_budget = self._BANNER_WIDTH - 2 - self._CFG_KEY_W - 3
+            v1_clip = _truncate_path(v1, budget=v1_budget)
+            return f"  {self._pad_visible(k1, self._CFG_KEY_W)} {DIM}│{RESET} {BOLD}{self._pad_visible(v1_clip, v1_budget)}{RESET}"
+        v1_clip = _truncate_path(v1, budget=self._CFG_VAL_W)
+        v2_clip = _truncate_path(v2, budget=self._CFG_VAL2_W)
         return (
-            f"  {k1:<{key_pad}} {DIM}│{RESET} {BOLD}{v1:<{val_pad}}{RESET}"
-            f" {DIM}│{RESET} {k2:<{key2_pad}} {DIM}│{RESET} {BOLD}{v2}{RESET}"
+            f"  {self._pad_visible(k1, self._CFG_KEY_W)} {DIM}│{RESET} "
+            f"{BOLD}{self._pad_visible(v1_clip, self._CFG_VAL_W)}{RESET} "
+            f"{DIM}│{RESET} {self._pad_visible(k2, self._CFG_KEY2_W)} "
+            f"{DIM}│{RESET} {BOLD}{self._pad_visible(v2_clip, self._CFG_VAL2_W)}{RESET}"
         )
 
     def _pacing_summary(self) -> str:
@@ -940,6 +964,34 @@ class NxcAutomator:
     # ---------------------------------------------------------------
     # Post-exploitation: DC detection, enum/modules, BloodHound
     # ---------------------------------------------------------------
+
+    def _probe_smb_banner(self, host: str, open_ports: set[int] | None = None):
+        """Quick SMB banner probe to populate host_names / host_domain BEFORE
+        the per-host header is printed during the spray. Done with a null /
+        no-cred call to `nxc smb` — nxc emits the (name:...) (domain:...)
+        info line even on STATUS_LOGON_FAILURE, so the probe is cheap and
+        works against locked-down hosts.
+
+        Skipped when:
+          - we already know the name/domain (e.g. cached from a prior host),
+          - --nmap is on AND port 445 is closed for this host,
+          - nxc is missing (pre-flight should have caught it, but be safe)."""
+        if host in self.host_names and host in self.host_domain:
+            return
+        if open_ports is not None and 445 not in open_ports and 139 not in open_ports:
+            return
+        cmd = ["nxc", "smb", host, "-u", "", "-p", "", "--timeout", "5"]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+            text = (result.stdout or "") + "\n" + (result.stderr or "")
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return
+        m_name = SMB_NAME_RE.search(text)
+        if m_name:
+            self.host_names[host] = m_name.group(1).strip()
+        m_domain = SMB_DOMAIN_RE.search(text)
+        if m_domain:
+            self.host_domain[host] = m_domain.group(1).strip().lower()
 
     def _detect_dc_from_results(
         self,
@@ -1717,11 +1769,12 @@ class NxcAutomator:
                 for host, open_ports in discovered.items():
                     tasks = self._build_protocol_tasks(open_ports if self.nmap_enabled else None)
 
+                    # Cheap SMB probe so the live header can show the AD name+domain
+                    # (DC01.corp.local) right next to the IP, not just in the final report.
+                    self._probe_smb_banner(host, open_ports if self.nmap_enabled else None)
+
                     if self.verbosity > V_QUIET:
-                        # Header tag uses PTR if available; the SMB-banner-derived
-                        # name lands here later (after the spray) but the FINAL
-                        # REPORT will pick it up via _format_host_tag.
-                        hostname = self.resolver.resolve(host)
+                        hostname = self._resolved_hostname(host)
                         header = f"  {GREEN}{BOLD}► {host}{RESET}"
                         if hostname:
                             header += f" {DIM}({hostname}){RESET}"
@@ -1780,15 +1833,12 @@ class NxcAutomator:
         if self.strict and self.strict_errors:
             sys.exit(1)
 
-    def _format_host_tag(self, host: str, width: int = 0) -> str:
-        """Render '10.10.10.5' or '10.10.10.5 (DC01.corp.local)' for the report.
-
-        Resolution order:
-          1. Reverse-DNS PTR (works when the engagement network has DNS)
-          2. SMB banner: 'NAME' + 'domain' extracted by nxc during the spray
-             — works on AD networks even with no DNS infrastructure
-          3. Raw IP only
-        """
+    def _resolved_hostname(self, host: str) -> str | None:
+        """Best hostname we know for `host`, in order:
+          1. DNS PTR (when the engagement network has DNS)
+          2. SMB banner 'NAME.domain' captured by _probe_smb_banner /
+             _detect_dc_from_results (works on isolated AD)
+          3. None (caller falls back to raw IP)"""
         hostname = self.resolver.resolve(host) if self.resolver else None
         if not hostname:
             name = self.host_names.get(host)
@@ -1797,6 +1847,11 @@ class NxcAutomator:
                 hostname = f"{name}.{domain}"
             elif name:
                 hostname = name
+        return hostname
+
+    def _format_host_tag(self, host: str, width: int = 0) -> str:
+        """Render '10.10.10.5' or '10.10.10.5 (DC01.corp.local)' for the report."""
+        hostname = self._resolved_hostname(host)
         tag = f"{host} ({hostname})" if hostname else host
         return tag.ljust(width) if width else tag
 
