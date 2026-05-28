@@ -3,6 +3,7 @@
 import sqlite3
 import time
 from pathlib import Path
+from threading import Lock
 
 
 class HostCache:
@@ -34,6 +35,24 @@ class HostCache:
         ran_at INTEGER NOT NULL,
         success INTEGER NOT NULL
     );
+
+    -- Tried credential combinations. Used by --skip-tried so re-runs after
+    -- adding new users/passwords to the wordlists only spray the new combos.
+    -- We persist only the SHA1 of the secret (never the plaintext) plus the
+    -- result so we can optionally retry past failures with --rerun-after.
+    CREATE TABLE IF NOT EXISTS tried_creds (
+        target TEXT NOT NULL,
+        protocol TEXT NOT NULL,
+        local_auth INTEGER NOT NULL,
+        user TEXT NOT NULL,
+        secret_hash TEXT NOT NULL,
+        domain TEXT,
+        result TEXT NOT NULL,     -- 'ok' | 'fail' | 'timeout'
+        pwn3d INTEGER NOT NULL DEFAULT 0,
+        attempted_at INTEGER NOT NULL,
+        PRIMARY KEY (target, protocol, local_auth, user, secret_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tried_attempted ON tried_creds(attempted_at);
     """
 
     def __init__(self, path: Path, ttl: int):
@@ -42,7 +61,12 @@ class HostCache:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # 30s busy-timeout absorbs concurrent runs / slow disks without
         # the dreaded 'database is locked' crash.
-        self._conn = sqlite3.connect(str(self.path), timeout=30)
+        # check_same_thread=False is required because record_attempt() is
+        # called from worker threads in the protocol-spray ThreadPoolExecutor.
+        # SQLite itself serializes writes; we add a Python-level lock to keep
+        # multi-statement sequences (e.g. clear_tried_cache) atomic.
+        self._conn = sqlite3.connect(str(self.path), timeout=30, check_same_thread=False)
+        self._lock = Lock()
         self._conn.executescript(self.SCHEMA)
         self._conn.commit()
 
@@ -123,6 +147,73 @@ class HostCache:
             (domain.lower(), dc_ip, auth_user, output_path, int(time.time()), 1 if success else 0),
         )
         self._conn.commit()
+
+    # ---- tried_creds ----------------------------------------------------
+
+    def was_tried(
+        self,
+        target: str,
+        protocol: str,
+        local_auth: bool,
+        user: str,
+        secret_hash: str,
+        rerun_after: int = 0,
+    ) -> str | None:
+        """Return 'ok' / 'fail' / 'timeout' if this combination has been
+        attempted before, or None if we should attempt it now.
+
+        rerun_after = 0 means 'never re-attempt' (the default --skip-tried
+        behaviour: anything tried before stays skipped). rerun_after = N
+        means 'rerun if older than N seconds AND the previous result wasn't ok'.
+        Successes (ok / pwn3d) are never re-attempted by default."""
+        row = self._conn.execute(
+            "SELECT result, pwn3d, attempted_at FROM tried_creds "
+            "WHERE target = ? AND protocol = ? AND local_auth = ? AND user = ? AND secret_hash = ?",
+            (target, protocol, 1 if local_auth else 0, user, secret_hash),
+        ).fetchone()
+        if not row:
+            return None
+        result, pwn3d, attempted_at = row
+        # Always skip past successes — there's no value in re-spraying a known cred.
+        if result == "ok" or pwn3d:
+            return result
+        if rerun_after > 0 and (int(time.time()) - attempted_at) >= rerun_after:
+            return None  # stale failure → caller will retry
+        return result
+
+    def record_attempt(
+        self,
+        target: str,
+        protocol: str,
+        local_auth: bool,
+        user: str,
+        secret_hash: str,
+        domain: str | None,
+        result: str,
+        pwn3d: bool = False,
+    ):
+        """Persist the outcome of a single spray attempt. Upserts on PK.
+        Called from worker threads in the spray pool — lock-protected."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO tried_creds "
+                "(target, protocol, local_auth, user, secret_hash, domain, result, pwn3d, attempted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (target, protocol, 1 if local_auth else 0, user, secret_hash,
+                 domain, result, 1 if pwn3d else 0, int(time.time())),
+            )
+            self._conn.commit()
+
+    def clear_tried_cache(self) -> int:
+        """Wipe the tried_creds table. Returns the number of rows deleted."""
+        count = self._conn.execute("SELECT COUNT(*) FROM tried_creds").fetchone()[0]
+        self._conn.execute("DELETE FROM tried_creds")
+        self._conn.commit()
+        return int(count)
+
+    def count_tried(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) FROM tried_creds").fetchone()
+        return int(row[0]) if row else 0
 
     def close(self):
         self._conn.close()

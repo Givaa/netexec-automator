@@ -9,6 +9,34 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 
 ## [Unreleased]
 
+### Added — Incremental spray (`--skip-tried`)
+- **`--skip-tried`**: persist every (target, protocol, scope, user, secret)
+  attempt to the SQLite cache and skip combinations seen in prior runs.
+  Lets you add new users / passwords to your wordlists and re-spray
+  only the new combinations against a wide CIDR without paying the cost
+  of the previous run again. Successes (and any `(Pwn3d!)` line) are
+  **always** skipped on re-runs.
+- **`--rerun-after <SECONDS>`**: re-attempt past *failures* older than
+  this many seconds. Default `0` = never re-attempt failures.
+- **`--clear-tried-cache`**: wipe the `tried_creds` table from the cache
+  and exit. Use this when you want `--skip-tried` to start fresh.
+- New `tried_creds` SQLite table (PK: target, protocol, local_auth,
+  user, secret_hash). Only SHA1 of the secret is stored — **never the
+  plaintext password**. user is a separate column so the same password
+  used by two users is correctly tracked as two attempts.
+- Thread-safety: HostCache now opens the SQLite connection with
+  `check_same_thread=False` and serializes writes with an internal lock,
+  because record_attempt() is invoked from the spray worker threads.
+- Banner gets a new `Incremental` row when `--skip-tried` is on, showing
+  the prior-entry count and the rerun policy. The FINAL REPORT gains
+  a `SKIPPED — ALREADY TRIED (N)` block when any combinations were
+  skipped during the run, with a pointer to the cache path.
+- 13 new pytest cases in `tests/test_skip_tried.py` covering: cache
+  round-trip, success-always-skipped, stale-failure retry with
+  `--rerun-after`, PK upsert (no duplicates), local-auth as part of the
+  key, fingerprint stability + plaintext-leak guard, --skip-tried opens
+  the cache even without --nmap, default off. 140 → 153 total.
+
 ### Added — Installable as a real binary on Kali / Debian / Ubuntu / macOS
 - **`pyproject.toml`** (hatchling backend) with two console entry points:
   - `netexec-automator` (full name)

@@ -2,6 +2,7 @@
 spray → live results → detect DC → post-exploit enum/modules/secretsdump →
 crack → BloodHound → exports."""
 
+import hashlib
 import os
 import random
 import shlex
@@ -93,6 +94,8 @@ class NxcAutomator:
         resolve_enabled: bool = True,
         resolve_timeout: float = 2.0,
         no_banner: bool = False,
+        skip_tried: bool = False,
+        rerun_after: int = 0,
     ):
         self.targets = self._read_value_or_file(target)
         self.mode = mode.lower()
@@ -140,8 +143,9 @@ class NxcAutomator:
             NmapScanner(ports=self._all_known_ports(), log_cmd=self._log_command)
             if nmap_enabled else None
         )
-        # Cache is also useful for DC/bloodhound dedup even without --nmap.
-        cache_useful = (nmap_enabled or bloodhound_enabled) and cache_enabled
+        # Cache is also useful for DC/bloodhound dedup even without --nmap,
+        # and is required by --skip-tried (the tried_creds table lives here).
+        cache_useful = (nmap_enabled or bloodhound_enabled or skip_tried) and cache_enabled
         resolved_cache_path = Path(cache_path).expanduser() if cache_path else CACHE_DEFAULT_PATH
         self.cache = HostCache(resolved_cache_path, ttl=cache_ttl) if cache_useful else None
 
@@ -176,6 +180,9 @@ class NxcAutomator:
         self.strict = strict
         self.resolver = HostnameResolver(timeout=resolve_timeout, enabled=resolve_enabled)
         self.no_banner = no_banner
+        self.skip_tried = skip_tried
+        self.rerun_after = max(0, int(rerun_after))
+        self.skipped_already_tried = 0  # counter for the FINAL REPORT
         self.strict_errors: list[str] = []
 
         # Cross-host state populated during the run.
@@ -531,6 +538,40 @@ class NxcAutomator:
         if nap > 0:
             time.sleep(nap)
 
+    @staticmethod
+    def _credential_fingerprint(credential: Credential) -> str:
+        """Stable SHA1 of just the secret (password or hash). The user is
+        already a separate PK column in tried_creds — this lets us look up
+        '(target, protocol, local_auth, user, secret_hash)' without ever
+        persisting the plaintext password to disk."""
+        secret = credential.nthash or (credential.password or "")
+        if credential.lmhash:
+            secret = f"{credential.lmhash}:{secret}"
+        return hashlib.sha1(secret.encode("utf-8", errors="replace")).hexdigest()
+
+    def _record_attempt_in_cache(
+        self,
+        target: str,
+        protocol: str,
+        local_auth: bool,
+        credential: Credential,
+        secret_fp: str,
+        result: str,
+        pwn3d: bool,
+    ):
+        """Persist a single (target, proto, scope, user, secret) attempt to
+        the SQLite cache for future --skip-tried lookups. No-op when cache
+        is disabled."""
+        if not (self.skip_tried and self.cache is not None):
+            return
+        try:
+            self.cache.record_attempt(
+                target, protocol, local_auth, credential.user, secret_fp,
+                self.domain, result, pwn3d,
+            )
+        except Exception as exc:  # noqa: BLE001 — cache write should never break the spray
+            self._vprint(V_VERBOSE, f"  {DIM}cache record_attempt failed: {exc}{RESET}")
+
     def _run_protocol_task(self, protocol: str, target: str, local_auth: bool = False) -> list[str]:
         """Run all credential pairs for one protocol/auth-type, return captured output."""
         output_lines: list[str] = []
@@ -550,8 +591,30 @@ class NxcAutomator:
                 ran += 1
                 self._update_progress()
                 continue
+
+            # --skip-tried: check the SQLite cache for a prior attempt of this
+            # exact (target, protocol, scope, user, secret) combination.
+            secret_fp = self._credential_fingerprint(credential)
+            if self.skip_tried and self.cache is not None:
+                prior = self.cache.was_tried(
+                    target, protocol, local_auth, credential.user,
+                    secret_fp, rerun_after=self.rerun_after,
+                )
+                if prior:
+                    self._vprint(
+                        V_VERBOSE,
+                        f"  {DIM}↷ already tried ({prior}): {self._task_label(protocol, local_auth)} "
+                        f"{credential.user or '<empty>'}{RESET}",
+                    )
+                    self.skipped_already_tried += 1
+                    ran += 1
+                    self._update_progress()
+                    continue
+
             cmd = self._build_nxc_command(protocol, target, credential, local_auth)
             self._log_command(self._task_label(protocol, local_auth), cmd, target=target)
+            attempt_result = "fail"
+            attempt_pwn3d = False
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=self.subprocess_timeout)
                 stdout = (result.stdout or "").strip()
@@ -572,13 +635,24 @@ class NxcAutomator:
 
                 if classification == "connectivity_timeout":
                     timeout_count += 1
+                    attempt_result = "timeout"
                 else:
                     timeout_count = 0
+
+                # Mark this attempt as successful for skip-tried bookkeeping;
+                # pwn3d annotation is separate (admin-on-host).
+                if "[+]" in stdout:
+                    attempt_result = "ok"
+                    attempt_pwn3d = self._is_pwn3d(stdout)
 
                 # Stop-on-success: bail out of this protocol/host as soon as we
                 # see a [+] line, so we don't keep trying the rest of the
                 # credentials (and risk account lockout).
                 if self.stop_on_success and "[+]" in stdout:
+                    self._record_attempt_in_cache(
+                        target, protocol, local_auth, credential, secret_fp,
+                        attempt_result, attempt_pwn3d,
+                    )
                     ran += 1
                     self._update_progress()
                     remaining = total_per_task - ran
@@ -593,7 +667,12 @@ class NxcAutomator:
                     return output_lines
             except subprocess.TimeoutExpired:
                 timeout_count += 1
+                attempt_result = "timeout"
 
+            self._record_attempt_in_cache(
+                target, protocol, local_auth, credential, secret_fp,
+                attempt_result, attempt_pwn3d,
+            )
             ran += 1
             self._update_progress()
 
@@ -737,6 +816,12 @@ class NxcAutomator:
             if self.cracker.rules:
                 crack_str += f" · rules={Path(self.cracker.rules).name}"
             rows.append(("Cracking", crack_str, None, None))
+
+        if self.skip_tried and self.cache is not None:
+            tried_n = self.cache.count_tried()
+            rerun = f"rerun-after={self.rerun_after}s" if self.rerun_after else "no rerun"
+            rows.append(("Incremental", f"skip-tried · {tried_n} prior entries · {rerun}",
+                         None, None))
 
         # Header / footer bar at the same width as the decorative banner.
         bar = "─" * self._BANNER_WIDTH
@@ -1923,6 +2008,11 @@ class NxcAutomator:
             tail = f" (+{extra} more)" if extra > 0 else ""
             print(f"  {ICON_NOOP} {YELLOW}{BOLD}NO RESPONSE ({len(self.dead_hosts)}){RESET}")
             print(f"     {DIM}{', '.join(shown)}{tail}{RESET}")
+            print()
+
+        if self.skip_tried and self.skipped_already_tried:
+            print(f"  {ICON_SKIP} {DIM}{BOLD}SKIPPED — ALREADY TRIED ({self.skipped_already_tried}){RESET}")
+            print(f"     {DIM}cached in {_truncate_path(self.cache.path) if self.cache else '?'} — pass --rerun-after to retry failures{RESET}")
             print()
 
         # Bottom line: if literally nothing happened, say so plainly.

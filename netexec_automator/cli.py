@@ -154,6 +154,19 @@ def _build_parser():
     g_scan.add_argument("--cache-path",
                         help=f"Custom SQLite cache path (default: {CACHE_DEFAULT_PATH}). Use this to "
                              "isolate concurrent / CI runs from each other.")
+    g_scan.add_argument("--skip-tried", action="store_true",
+                        help="Persist every (target, protocol, scope, user, secret) attempt to the "
+                             "SQLite cache and skip it on subsequent runs. Lets you add new users/"
+                             "passwords to the wordlists and re-run only the new combinations. "
+                             "Successes (and (Pwn3d!) lines) are always skipped on re-runs; "
+                             "failures stay skipped unless --rerun-after fires.")
+    g_scan.add_argument("--rerun-after", type=int, default=0, metavar="SECONDS",
+                        help="With --skip-tried: re-attempt past *failures* older than this many "
+                             "seconds (default: 0 = never re-attempt failures). Successes are still "
+                             "always skipped.")
+    g_scan.add_argument("--clear-tried-cache", action="store_true",
+                        help="Wipe the tried_creds table from the cache and exit. Use this when "
+                             "you want --skip-tried to start fresh.")
 
     # ----- Post-exploitation -----
     g_post = parser.add_argument_group("post-exploitation (runs only on valid creds)")
@@ -317,6 +330,22 @@ def main():
             sys.exit(2)
         sys.exit(subprocess.call(["bash", str(script)]))
 
+    if args.clear_tried_cache:
+        # One-shot maintenance: wipe the tried_creds table and exit. Honors
+        # --cache-path so concurrent CI runs can clear their own DB.
+        from .cache import HostCache
+        cache_path = Path(args.cache_path).expanduser() if args.cache_path else CACHE_DEFAULT_PATH
+        if not cache_path.exists():
+            print(f"{DIM}cache file does not exist at {cache_path} — nothing to clear{RESET}")
+            sys.exit(0)
+        cache = HostCache(cache_path, ttl=args.cache_ttl)
+        try:
+            n = cache.clear_tried_cache()
+        finally:
+            cache.close()
+        print(f"cleared {n} tried_creds entries from {cache_path}")
+        sys.exit(0)
+
     if not args.target:
         parser.error("-t/--target is required (or use --update-nxc to install the nxc binary).")
 
@@ -377,6 +406,8 @@ def main():
             resolve_enabled=not args.no_resolve,
             resolve_timeout=args.resolve_timeout,
             no_banner=args.no_banner,
+            skip_tried=args.skip_tried,
+            rerun_after=args.rerun_after,
         )
         runner.run()
     except ValueError as exc:

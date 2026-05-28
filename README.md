@@ -73,6 +73,11 @@ python3 netexec-automator.py -t targets.txt --combo loot.txt --nmap --low-power
 
 # 7. Recon only — get open ports per host, no auth attempts
 python3 netexec-automator.py -t 10.10.10.0/24 -u x -p x --scan-only
+
+# 8. Incremental spray — only try combinations not seen in previous runs
+python3 netexec-automator.py -t targets.txt --combo loot.txt --nmap --skip-tried
+# (add new users to users.txt, run again → only the new ones get sprayed)
+python3 netexec-automator.py -t targets.txt --combo loot.txt --nmap --skip-tried
 ```
 
 `python3 netexec-automator.py --help` shows every flag, grouped by purpose, with examples.
@@ -490,6 +495,9 @@ Most-used flags at a glance:
 | `--no-cache` | off | Bypass SQLite cache |
 | `--cache-ttl` | 86400 | Nmap cache validity in seconds |
 | `--cache-path` | `~/.cache/...` | Custom SQLite cache path (isolate parallel/CI runs) |
+| `--skip-tried` | off | Skip (host, protocol, scope, user, secret) combinations already attempted in a previous run. Successes are always skipped on re-runs. |
+| `--rerun-after` | `0` | With `--skip-tried`: re-attempt past *failures* older than this many seconds (0 = never) |
+| `--clear-tried-cache` | off | Wipe the tried-credentials cache and exit |
 | `--enum` | off | SMB enum probes into `loot/` |
 | `--modules` | — | Comma-separated nxc `-M` modules |
 | `--bloodhound` | off | Auto-collect BloodHound per discovered domain |
