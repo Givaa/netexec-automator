@@ -92,6 +92,7 @@ class NxcAutomator:
         strict: bool = False,
         resolve_enabled: bool = True,
         resolve_timeout: float = 2.0,
+        no_banner: bool = False,
     ):
         self.targets = self._read_value_or_file(target)
         self.mode = mode.lower()
@@ -172,6 +173,7 @@ class NxcAutomator:
         self.cracked_creds: list[dict] = []  # post-crack (user, plain) records
         self.strict = strict
         self.resolver = HostnameResolver(timeout=resolve_timeout, enabled=resolve_enabled)
+        self.no_banner = no_banner
         self.strict_errors: list[str] = []
 
         # Cross-host state populated during the run.
@@ -672,52 +674,108 @@ class NxcAutomator:
             parts.append("bloodhound")
         return " · ".join(parts) if parts else "—"
 
+    # ---- banner rendering -------------------------------------------------
+
+    # Column widths for the run-summary table. Stable padding makes the
+    # banner read like a tidy spec-sheet instead of the previous staircase.
+    _CFG_KEY_W = 13
+    _CFG_VAL_W = 20
+    _CFG_KEY2_W = 11
+
     def _print_scan_banner(self, total_attempts: int):
+        from .banner import render_startup_banner
+
+        # Decorative banner (ASCII art + quote + credits) — suppressed
+        # entirely by --no-banner or in --quiet mode.
+        if not self.no_banner:
+            print()
+            print(render_startup_banner(width=72))
+            print()
+
         nmap_status = "ON" if self.nmap_enabled else "OFF"
         cache_status = "ON" if self.cache else ("OFF" if (self.nmap_enabled or self.bloodhound_enabled) else "n/a")
         verbosity_label = {V_DEBUG: "DEBUG", V_VERBOSE: "VERBOSE", V_NORMAL: "NORMAL", V_QUIET: "QUIET"}.get(self.verbosity, "NORMAL")
-        print(f"\n{BOLD}{'═' * BANNER_WIDTH}{RESET}")
-        print(f"  {CYAN}{BOLD}⚡ NetExec Automator{RESET}")
-        print(f"{'═' * BANNER_WIDTH}")
-        print(f"  Targets Count   {DIM}│{RESET} {BOLD}{len(self.targets):<11}{RESET} Protocols {DIM}│{RESET} {BOLD}{len(ALL_PROTOCOLS)}{RESET} (+ local auth)")
-        print(f"  Credentials     {DIM}│{RESET} {BOLD}{len(self.credentials):<11}{RESET} Workers   {DIM}│{RESET} {BOLD}{self.workers}{RESET}")
-        print(f"  Composition     {DIM}│{RESET} {BOLD}{self._credential_summary()}{RESET}")
-        print(f"  Auth Options    {DIM}│{RESET} {BOLD}{self._auth_options_summary()}{RESET}")
-        print(f"  Pairing Mode    {DIM}│{RESET} {BOLD}{self.mode.upper():<11}{RESET} Log File  {DIM}│{RESET} {BOLD}{_truncate_path(self.log_file)}{RESET}")
-        print(f"  Nmap Pre-scan   {DIM}│{RESET} {BOLD}{nmap_status:<11}{RESET} Cache     {DIM}│{RESET} {BOLD}{cache_status}{RESET}")
-        print(f"  Post-Exploit    {DIM}│{RESET} {BOLD}{self._post_exploit_summary()}{RESET}")
-        print(f"  Verbosity       {DIM}│{RESET} {BOLD}{verbosity_label:<11}{RESET} Loot Dir  {DIM}│{RESET} {BOLD}{_truncate_path(self.loot.root)}{RESET}")
         cmd_log_str = _truncate_path(self.cmd_log_path) if self.cmd_log_path else "disabled"
-        print(f"  Command Log     {DIM}│{RESET} {BOLD}{cmd_log_str}{RESET}")
-        pacing = []
-        if self.delay > 0 or self.jitter > 0:
-            pacing.append(f"delay={self.delay}s±{self.jitter}s")
-        if self.netexec_timeout != NETEXEC_TIMEOUT or self.subprocess_timeout != SUBPROCESS_TIMEOUT or self.max_retry != MAX_RETRY:
-            pacing.append(f"nxc-to={self.netexec_timeout}s")
-            pacing.append(f"py-to={self.subprocess_timeout}s")
-            pacing.append(f"retry={self.max_retry}")
+        resolve_str = "ON" if self.resolver.enabled else "OFF"
+
+        # Build the 2-column rows. Each is (key1, val1, key2, val2). Use
+        # None for key2 to span the whole row.
+        rows: list[tuple[str, str, str | None, str | None]] = [
+            ("Targets",      str(len(self.targets)),           "Protocols",   f"{len(ALL_PROTOCOLS)} (+local auth)"),
+            ("Credentials",  str(len(self.credentials)),       "Workers",     str(self.workers)),
+            ("Composition",  self._credential_summary(),       "Mode",        self.mode.upper()),
+            ("Auth opts",    self._auth_options_summary(),     "DNS PTR",     resolve_str),
+            ("Pre-scan",     nmap_status,                      "Cache",       cache_status),
+            ("Post-exploit", self._post_exploit_summary(),     "Verbosity",   verbosity_label),
+            ("Loot dir",     _truncate_path(self.loot.root),   "Log file",    _truncate_path(self.log_file)),
+            ("Cmd log",      cmd_log_str,                      None,           None),
+        ]
+
+        pacing = self._pacing_summary()
         if pacing:
-            print(f"  Pacing          {DIM}│{RESET} {BOLD}{' · '.join(pacing)}{RESET}")
-        filters: list[str] = []
-        if self.only_protocols:
-            filters.append(f"only={','.join(sorted(self.only_protocols))}")
-        if self.exclude_protocols:
-            filters.append(f"exclude={','.join(sorted(self.exclude_protocols))}")
-        if self.stop_on_success:
-            filters.append("stop-on-success")
-        if filters:
-            print(f"  Filters         {DIM}│{RESET} {BOLD}{' · '.join(filters)}{RESET}")
+            rows.append(("Pacing",   pacing, None, None))
+        filters_summary = self._filters_summary()
+        if filters_summary:
+            rows.append(("Filters",  filters_summary, None, None))
         if self.crack_enabled and self.cracker:
             wl = self.cracker.find_wordlist()
             wl_str = _truncate_path(wl) if wl else "missing"
-            print(f"  Cracking        {DIM}│{RESET} {BOLD}{self.cracker.cracker() or '?'} · wordlist={wl_str}"
-                  + (f" · rules={Path(self.cracker.rules).name}" if self.cracker.rules else "")
-                  + f"{RESET}")
+            crack_str = f"{self.cracker.cracker() or '?'} · wordlist={wl_str}"
+            if self.cracker.rules:
+                crack_str += f" · rules={Path(self.cracker.rules).name}"
+            rows.append(("Cracking", crack_str, None, None))
+
+        # Render header bar
+        bar = "─" * (self._CFG_KEY_W + self._CFG_VAL_W + self._CFG_KEY2_W + 12)
+        print(f"{DIM}{bar}{RESET}")
+        for k1, v1, k2, v2 in rows:
+            print(self._cfg_row(k1, v1, k2, v2))
+        print(f"{DIM}{bar}{RESET}")
+
+        # Footer: scan-only banner or task count
         if self.scan_only:
-            print(f"  {YELLOW}{BOLD}⚠ scan-only mode — no auth attempts will run{RESET}")
+            print(f"  {ICON_WARN} {YELLOW}{BOLD}scan-only mode — no auth attempts will run{RESET}")
         else:
-            print(f"  Total Tasks     {DIM}│{RESET} {BOLD}~{total_attempts}{RESET} {DIM}(upper bound, filtered by nmap){RESET}" if self.nmap_enabled else f"  Total Tasks     {DIM}│{RESET} {BOLD}{total_attempts}{RESET}")
-        print(f"{'═' * BANNER_WIDTH}\n")
+            label = f"~{total_attempts}" if self.nmap_enabled else f"{total_attempts}"
+            note = f" {DIM}(upper bound, filtered by nmap){RESET}" if self.nmap_enabled else ""
+            print(f"  {DIM}Total tasks queued:{RESET} {BOLD}{label}{RESET}{note}")
+        print()
+
+    def _cfg_row(self, k1: str, v1: str, k2: str | None, v2: str | None) -> str:
+        """Format one 2-column banner row with consistent padding."""
+        key_pad = self._CFG_KEY_W
+        val_pad = self._CFG_VAL_W
+        key2_pad = self._CFG_KEY2_W
+        if k2 is None:
+            return f"  {k1:<{key_pad}} {DIM}│{RESET} {BOLD}{v1}{RESET}"
+        return (
+            f"  {k1:<{key_pad}} {DIM}│{RESET} {BOLD}{v1:<{val_pad}}{RESET}"
+            f" {DIM}│{RESET} {k2:<{key2_pad}} {DIM}│{RESET} {BOLD}{v2}{RESET}"
+        )
+
+    def _pacing_summary(self) -> str:
+        parts: list[str] = []
+        if self.delay > 0 or self.jitter > 0:
+            parts.append(f"delay={self.delay}s±{self.jitter}s")
+        if (
+            self.netexec_timeout != NETEXEC_TIMEOUT
+            or self.subprocess_timeout != SUBPROCESS_TIMEOUT
+            or self.max_retry != MAX_RETRY
+        ):
+            parts.append(f"nxc-to={self.netexec_timeout}s")
+            parts.append(f"py-to={self.subprocess_timeout}s")
+            parts.append(f"retry={self.max_retry}")
+        return " · ".join(parts)
+
+    def _filters_summary(self) -> str:
+        parts: list[str] = []
+        if self.only_protocols:
+            parts.append(f"only={','.join(sorted(self.only_protocols))}")
+        if self.exclude_protocols:
+            parts.append(f"exclude={','.join(sorted(self.exclude_protocols))}")
+        if self.stop_on_success:
+            parts.append("stop-on-success")
+        return " · ".join(parts)
 
     def _collect_target_results(self, target: str, tasks: list[TaskKey], pair_count: int) -> dict[TaskKey, list[str]]:
         self.completed = 0

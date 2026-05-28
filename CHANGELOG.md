@@ -10,6 +10,26 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 ## [Unreleased]
 
 ### Added
+- **Decorative startup banner** with NXA block-letter ASCII art (sliver-style),
+  credits to Giovanni Rapa (@Givaa) + GitHub URL, and a random quote drawn
+  from a curated pool (LOTR, Hackers, WarGames, Mr. Robot, Pokémon, The
+  Matrix, Yoda, The Mandalorian — each picked because it captures the
+  "why one when you can have them all?" multi-protocol essence).
+  Implementation: `netexec_automator/banner.py`, pure Python, no deps.
+- New flag `--no-banner` suppresses the decorative banner entirely; the
+  run-summary table is still shown so scripted runs keep their context.
+- Run-summary table refactored into a clean two-column layout with
+  uniform padding (`_CFG_KEY_W` / `_CFG_VAL_W` / `_CFG_KEY2_W`). The
+  previous staircase look ("Targets Count" 13 chars vs "Composition"
+  11 chars, columns starting at different offsets) is gone — every row
+  now lines up under the same separator characters. Single-column rows
+  (Pacing / Filters / Cmd log / Cracking) flow underneath without
+  breaking the table border.
+- 8 new pytest cases for the banner (rendering, credits presence,
+  uniform-width rows, quote-pool integrity, --no-banner propagation) —
+  115 total now.
+
+### Added (earlier this cycle)
 - **Reverse-DNS PTR alongside target IPs** in the on-screen output. Each
   host header now prints `► 10.10.10.5 (dc01.corp.local)` when DNS
   resolves the IP, mirroring NetExec's classic `(name:…) (domain:…)`

@@ -2,7 +2,11 @@
 
 [![CI](https://github.com/Givaa/netexec-automator/actions/workflows/ci.yml/badge.svg)](https://github.com/Givaa/netexec-automator/actions/workflows/ci.yml)
 
-> Spray [NetExec](https://github.com/Pennyw0rth/NetExec) across **all 10 protocols** in parallel — with nmap pre-scan, hash & Kerberos auth, auto-enum, BloodHound collection, and a shell-pasteable commands transcript for your report.
+> *"One spray to rule them all."*
+>
+> Spray [NetExec](https://github.com/Pennyw0rth/NetExec) across **all 10 protocols** in parallel — with nmap pre-scan, hash & Kerberos auth, auto-enum, BloodHound collection, hash cracking, and a shell-pasteable commands transcript for your report.
+
+**Author**: Giovanni Rapa · [@Givaa](https://github.com/Givaa)
 
 ![NetExec Automator Demo](assets/netexec-automator-demo.gif)
 
@@ -426,6 +430,7 @@ Most-used flags at a glance:
 | `-v, --verbose` | 0 | `-v` commands+errors, `-vv` raw output |
 | `-q, --quiet` | off | Only print valid creds |
 | `--strict` | off | Exit 1 if any real error occurred (CI-friendly) |
+| `--no-banner` | off | Suppress the decorative startup banner (ASCII art + quote + credits) |
 | `-m, --mode` | `combination` | `combination` (cartesian) or `linear` (1-to-1) |
 
 ---

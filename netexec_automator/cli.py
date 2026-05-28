@@ -242,6 +242,9 @@ def _build_parser():
     g_out.add_argument("--strict", action="store_true",
                        help="Exit with code 1 if any real error occurred (subprocess fail, I/O error, "
                             "cracker failure). Useful in CI / scripted pipelines.")
+    g_out.add_argument("--no-banner", action="store_true",
+                       help="Suppress the decorative startup banner (ASCII art + quote + credits). "
+                            "The run summary table is still shown.")
 
     return parser
 
@@ -354,6 +357,7 @@ def main():
             strict=args.strict,
             resolve_enabled=not args.no_resolve,
             resolve_timeout=args.resolve_timeout,
+            no_banner=args.no_banner,
         )
         runner.run()
     except ValueError as exc:

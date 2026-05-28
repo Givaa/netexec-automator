@@ -33,6 +33,7 @@ from ._utils import _term_width, _truncate_path  # noqa: F401
 from .types import Credential, NxcActionResult  # noqa: F401
 
 # Helper classes
+from .banner import QUOTES, render_startup_banner  # noqa: F401
 from .bloodhound import BloodHoundRunner  # noqa: F401
 from .cache import HostCache  # noqa: F401
 from .cracker import HashCracker  # noqa: F401
