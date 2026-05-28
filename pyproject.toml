@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "netexec-automator"
+version = "0.1.0"
+description = "Spray NetExec across all 10 protocols in parallel — with nmap pre-scan, hash & Kerberos auth, auto-enum, BloodHound collection, hash cracking, and a shell-pasteable commands transcript."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Giovanni Rapa", email = "rapagiovanni@gmail.com" },
+]
+requires-python = ">=3.10"
+keywords = ["netexec", "nxc", "pentest", "active-directory", "oscp", "smb", "ldap", "kerberos", "bloodhound", "hashcat"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+# Stdlib-only at runtime. nxc / nmap / hashcat / bloodhound-python are
+# external commands the tool shells out to — see README for install hints.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+netexec-automator = "netexec_automator.cli:main"
+nxa = "netexec_automator.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Givaa/netexec-automator"
+Changelog = "https://github.com/Givaa/netexec-automator/blob/main/CHANGELOG.md"
+Issues = "https://github.com/Givaa/netexec-automator/issues"
+
+# ---- hatchling build configuration --------------------------------------
+
+[tool.hatch.build.targets.wheel]
+packages = ["netexec_automator"]
+
+# Bundle the shell helpers as package data so `nxa --update-nxc` keeps
+# working after a pipx install (they wouldn't otherwise be next to the
+# package on disk).
+[tool.hatch.build.targets.wheel.force-include]
+"scripts/update-nxc.sh" = "netexec_automator/_scripts/update-nxc.sh"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/netexec_automator",
+    "/netexec-automator.py",
+    "/scripts",
+    "/tests",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]

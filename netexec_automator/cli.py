@@ -286,15 +286,34 @@ def _merge_toml_into_args(args, parser):
     return args
 
 
+def _find_update_nxc_script() -> Path | None:
+    """Locate scripts/update-nxc.sh whether running from a checked-out repo
+    OR from a pipx/pip install (where the script is bundled as package data
+    under netexec_automator/_scripts/)."""
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here.parent / "scripts" / "update-nxc.sh",      # repo layout
+        here / "_scripts" / "update-nxc.sh",             # pipx/pip install (package_data)
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
 def main():
     parser = _build_parser()
     args = parser.parse_args()
 
     if args.update_nxc:
-        # __file__ is netexec_automator/cli.py → repo root is two parents up.
-        script = Path(__file__).resolve().parent.parent / "scripts" / "update-nxc.sh"
-        if not script.exists():
-            print(f"{RED}Error: {script} not found.{RESET}", file=sys.stderr)
+        script = _find_update_nxc_script()
+        if not script:
+            print(
+                f"{RED}Error: update-nxc.sh not found in any of the expected locations.{RESET}\n"
+                f"  {DIM}Run the script directly from the repo: ./scripts/update-nxc.sh{RESET}\n"
+                f"  {DIM}or: curl -fsSL https://raw.githubusercontent.com/Givaa/netexec-automator/main/scripts/update-nxc.sh | bash{RESET}",
+                file=sys.stderr,
+            )
             sys.exit(2)
         sys.exit(subprocess.call(["bash", str(script)]))
 

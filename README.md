@@ -99,16 +99,50 @@ python3 netexec-automator.py -t 10.10.10.0/24 -u x -p x --scan-only
 
 ## Install
 
-### Standard
+### Requirements
 
-Requirements:
 - Python 3.10+
 - [NetExec](https://github.com/Pennyw0rth/NetExec) (`nxc` in `PATH`)
 - [nmap](https://nmap.org/) — only for `--nmap` / `--scan-only`
 - [bloodhound-python](https://github.com/dirkjanm/BloodHound.py) (`pip install bloodhound`) — only for `--bloodhound`
 - [hashcat](https://hashcat.net/) (preferred) or [john](https://www.openwall.com/john/) — only for `--crack`; rockyou is auto-discovered under `/usr/share/wordlists/` and friends
 
-The tool itself is a single Python file with **no external dependencies** (stdlib only):
+The tool itself has **no Python runtime dependencies** — stdlib only.
+
+### Install: `nxa` shortcut on Kali (recommended)
+
+```bash
+git clone https://github.com/Givaa/netexec-automator
+cd netexec-automator
+./scripts/install.sh
+```
+
+The installer prefers `pipx` (already on Kali), falls back to `pip install --user` if pipx is missing. After install:
+
+```bash
+nxa --help                          # short alias
+netexec-automator --help            # full name
+nxa --update-nxc                    # install/update the official nxc binary
+```
+
+Both shortcuts land in `~/.local/bin/`. If that's not in your `$PATH` yet, the installer tells you what line to add to `~/.bashrc` / `~/.zshrc`.
+
+To uninstall: `./scripts/install.sh --uninstall`.
+
+### Install: standalone binary (no Python required)
+
+For ultra-portable / air-gapped scenarios — produces a single `~50 MB` self-contained binary that embeds the Python interpreter:
+
+```bash
+./scripts/build-binary.sh                       # → dist/nxa
+./scripts/build-binary.sh --install /usr/local/bin   # build + drop in /usr/local/bin
+```
+
+Powered by PyInstaller; the build venv is cached under `.pyinstaller-venv/` so subsequent builds are fast.
+
+### Install: just run the script (no install)
+
+The thin launcher works directly from a clone — useful for quick tests or contexts where you don't want to install anything:
 
 ```bash
 git clone https://github.com/Givaa/netexec-automator
@@ -116,11 +150,15 @@ cd netexec-automator
 python3 netexec-automator.py --help
 ```
 
-#### Get / update the `nxc` binary
+### Get / update the `nxc` binary
 
 NetExec publishes pre-built standalone binaries (PyInstaller) on its GitHub Releases. The bundled `scripts/update-nxc.sh` will pull the right one for your platform — no `pip`, no Python dependency hell, no sudo required:
 
 ```bash
+# If you ran ./scripts/install.sh, just use:
+nxa --update-nxc
+
+# Otherwise call the script directly:
 ./scripts/update-nxc.sh                  # detect platform, install to ~/.local/bin/nxc
 ./scripts/update-nxc.sh --check          # dry-run: show what would be downloaded
 ./scripts/update-nxc.sh --prefix /usr/local/bin   # system-wide install

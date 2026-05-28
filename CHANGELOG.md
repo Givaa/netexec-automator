@@ -9,6 +9,31 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 
 ## [Unreleased]
 
+### Added — Installable as a real binary on Kali / Debian / Ubuntu / macOS
+- **`pyproject.toml`** (hatchling backend) with two console entry points:
+  - `netexec-automator` (full name)
+  - `nxa` (short alias for daily use)
+  Standard Python packaging — `pip install .` or `pipx install .` from the
+  repo root produces both shortcuts in `~/.local/bin/`.
+- **`scripts/install.sh`** opinionated installer: detects pipx first
+  (preferred — isolated venv, no PEP 668 hassles), falls back to
+  `pip install --user` with `--break-system-packages` when needed on newer
+  Debian/Kali. Supports `--uninstall` and `--force-pip` overrides, prints
+  a PATH hint when `~/.local/bin` isn't picked up yet.
+- **`scripts/build-binary.sh`** — PyInstaller wrapper for a single
+  ~50 MB standalone `nxa` binary that embeds the Python interpreter
+  (useful for ultra-portable / air-gapped scenarios). `--install <prefix>`
+  drops the binary in `/usr/local/bin/` and adds a `netexec-automator`
+  symlink. Build venv cached under `.pyinstaller-venv/`.
+- `update-nxc.sh` is now bundled as **package data** via
+  `[tool.hatch.build.targets.wheel.force-include]` so `nxa --update-nxc`
+  keeps working after a pipx install (the script lives in the package
+  directory rather than next to the source repo).
+- `_find_update_nxc_script()` resolves the script across both layouts
+  (repo and pipx install), with a curl-from-github fallback hint in the
+  error message when neither is available. New pytest case in
+  `test_tier_c.py` to lock in repo-layout discovery.
+
 ### Changed — Output redesigned (default is now concise)
 - The default verbosity used to dump every single nxc auth attempt
   per protocol per host — useful for debugging, noisy in practice. The

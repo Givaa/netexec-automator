@@ -51,6 +51,16 @@ def test_resolve_dc_via_dns_no_tools_returns_empty(nxa):
         assert nxa.NxcAutomator._resolve_dc_via_dns("corp.local") == []
 
 
+def test_find_update_nxc_script_in_repo_layout(nxa):
+    """When running from a checked-out repo, the script must be locatable
+    via the repo-root path (scripts/update-nxc.sh next to the package dir)."""
+    from netexec_automator.cli import _find_update_nxc_script
+    script = _find_update_nxc_script()
+    assert script is not None
+    assert script.name == "update-nxc.sh"
+    assert script.exists()
+
+
 def test_resolve_dc_via_dns_parses_dig_output(nxa):
     fake_dig = mock.Mock()
     fake_dig.returncode = 0
