@@ -7,8 +7,8 @@ from pathlib import Path
 
 from .automator import NxcAutomator
 from .constants import (BOLD, CACHE_DEFAULT_PATH, CACHE_DEFAULT_TTL,
-                        CRACK_DEFAULT_TIMEOUT, DEFAULT_WORKERS, MAX_RETRY,
-                        NETEXEC_TIMEOUT, RED, RESET, SUBPROCESS_TIMEOUT,
+                        CRACK_DEFAULT_TIMEOUT, DEFAULT_WORKERS, EXAM_SAFE_BLOCKLIST,
+                        MAX_RETRY, NETEXEC_TIMEOUT, RED, RESET, SUBPROCESS_TIMEOUT,
                         V_DEBUG, V_QUIET, YELLOW, LOW_POWER_PROFILE, DIM)
 
 
@@ -19,6 +19,12 @@ def parse_mode(value: str) -> str:
     if mode in ("combination", "linear"):
         return mode
     raise argparse.ArgumentTypeError("Mode must be one of: combination, linear")
+
+
+def _normalize_module(name: str) -> str:
+    """Canonicalize an nxc module name for blocklist matching: lowercase and
+    treat '-' and '_' as equivalent so 'ms17-010' and 'ms17_010' compare equal."""
+    return name.strip().lower().replace("-", "_")
 
 
 def _load_toml_config(path: str) -> dict:
@@ -179,6 +185,11 @@ def _build_parser():
                         help="Run --shares/--users/--sessions/--loggedon-users/--pass-pol into loot/.")
     g_post.add_argument("--modules",
                         help="Comma-separated nxc -M modules (e.g. spider_plus,gpp_password,lsassy).")
+    g_post.add_argument("--exam-safe", action="store_true",
+                        help="Refuse to start if --modules contains an automated-exploitation module "
+                             "(zerologon, nopac, petitpotam, printnightmare, ms17-010, smbghost, "
+                             "dfscoerce, shadowcoerce, coerce_plus). Use during OSCP-style exams where "
+                             "automated exploitation is prohibited.")
     g_post.add_argument("--bloodhound", action="store_true",
                         help="Auto-collect BloodHound (-c All --zip) per discovered AD domain.")
     g_post.add_argument("--bloodhound-force", action="store_true",
@@ -332,6 +343,21 @@ def _validate_args(args, parser):
     if args.combo and (args.user or args.password or args.nthash):
         parser.error("--combo cannot be combined with -u/-p/-H "
                      "(combo lines carry the user already).")
+
+    # --exam-safe: refuse at startup if any requested module is an automated
+    # exploitation module. Matched case-insensitively, '-'/'_' interchangeable.
+    if args.exam_safe and args.modules:
+        blocked = {_normalize_module(b) for b in EXAM_SAFE_BLOCKLIST}
+        offenders = [
+            m.strip() for m in args.modules.split(",")
+            if m.strip() and _normalize_module(m) in blocked
+        ]
+        if offenders:
+            parser.error(
+                "--exam-safe: refusing to run prohibited module(s): "
+                f"{', '.join(offenders)}. These perform automated exploitation "
+                "and are blocked in exam-safe mode. Drop them from --modules to proceed."
+            )
 
     # --cracker choice already validated by argparse choices=
 

@@ -56,6 +56,28 @@ PROTOCOL_PORTS: dict[str, list[int]] = {
     "nfs":   [2049],
 }
 
+# ---- Exam-safe module blocklist ----------------------------------------
+
+# Modules refused at startup under --exam-safe. These are nxc -M modules that
+# perform *automated exploitation* of a known vulnerability (CVE exploit or
+# authentication-coercion) rather than passive enumeration — exactly the class
+# of "automated exploitation tools" forbidden in certification exams such as
+# OSCP. Enumeration/collection modules (spider_plus, gpp_password, etc.) are
+# intentionally allowed. Comparison is case-insensitive and treats '-' and '_'
+# as equivalent (see _normalize_module), so "ms17-010" matches "ms17_010".
+EXAM_SAFE_BLOCKLIST: frozenset[str] = frozenset({
+    "zerologon",      # CVE-2020-1472
+    "nopac",          # CVE-2021-42278 / 42287 (sAMAccountName spoofing)
+    "petitpotam",     # CVE-2021-36942 (EFSRPC coercion)
+    "printnightmare", # CVE-2021-1675 / 34527 (spooler RCE)
+    "ms17-010",       # EternalBlue
+    "smbghost",       # CVE-2020-0796 (SMBv3 compression)
+    "dfscoerce",      # MS-DFSNM coercion
+    "shadowcoerce",   # MS-FSRVP coercion
+    "coerce_plus",    # multi-vector auth coercion
+})
+
+
 # ---- Credential patterns / null-session --------------------------------
 
 HASH_NT_PATTERN = re.compile(r"^[a-fA-F0-9]{32}$")

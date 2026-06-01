@@ -115,6 +115,55 @@ def test_combo_with_user_is_rejected(tmp_path):
     assert "--combo" in err
 
 
+# ---- --exam-safe module blocklist ---------------------------------------
+
+def test_exam_safe_refuses_blocked_module(tmp_path):
+    """A prohibited module in --modules must abort before any work starts."""
+    rc, _, err = run_tool(
+        ["-t", "10.0.0.5", "-u", "u", "-p", "p", "--exam-safe",
+         "--modules", "spider_plus,zerologon", "--no-cmd-log"],
+        cwd=tmp_path,
+    )
+    assert rc == 2
+    assert "--exam-safe" in err
+    assert "zerologon" in err.lower()
+
+
+def test_exam_safe_matches_case_and_hyphen_insensitively(tmp_path):
+    """'MS17-010' must match the blocklisted 'ms17-010' / 'ms17_010'."""
+    rc, _, err = run_tool(
+        ["-t", "10.0.0.5", "-u", "u", "-p", "p", "--exam-safe",
+         "--modules", "MS17-010", "--no-cmd-log"],
+        cwd=tmp_path,
+    )
+    assert rc == 2
+    assert "--exam-safe" in err
+    assert "ms17-010" in err.lower()
+
+
+def test_exam_safe_allows_enum_modules(tmp_path):
+    """Pure enumeration modules must pass validation (rc != 2)."""
+    rc, out, err = run_tool(
+        ["-t", "10.0.0.5", "-u", "u", "-p", "p", "--exam-safe",
+         "--modules", "spider_plus,gpp_password", "--no-cmd-log"],
+        cwd=tmp_path,
+    )
+    # Should sail past _validate_args to the nxc preflight, not parser.error.
+    assert rc != 2
+    assert "--exam-safe" not in (out + err)
+
+
+def test_blocked_module_allowed_without_exam_safe(tmp_path):
+    """Without --exam-safe the blocklist is inert — nothing is refused."""
+    rc, out, err = run_tool(
+        ["-t", "10.0.0.5", "-u", "u", "-p", "p",
+         "--modules", "zerologon", "--no-cmd-log"],
+        cwd=tmp_path,
+    )
+    assert rc != 2
+    assert "exam-safe" not in (out + err).lower()
+
+
 # ---- _truncate_text -----------------------------------------------------
 
 def test_truncate_text_within_budget(nxa):

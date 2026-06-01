@@ -275,6 +275,8 @@ When `--enum`, `--modules`, or `--bloodhound` are on, a follow-up phase runs **p
 
 **`--modules X,Y`** runs any nxc `-M` module, comma-separated, into `loot/<host>/smb/<scope>/module-<name>.txt`.
 
+**`--exam-safe`** refuses to start if `--modules` lists an *automated-exploitation* module — `zerologon`, `nopac`, `petitpotam`, `printnightmare`, `ms17-010`, `smbghost`, `dfscoerce`, `shadowcoerce`, `coerce_plus` (matched case-insensitively, `-`/`_` interchangeable). Enumeration modules (`spider_plus`, `gpp_password`, …) are unaffected. Use it during OSCP-style exams where automated exploitation is prohibited; the offending module is named in the exit-2 error so you know what to drop. The blocklist lives in `EXAM_SAFE_BLOCKLIST` in `constants.py`.
+
 **`--bloodhound`** runs after all hosts have been sprayed. For each AD domain seen in nxc SMB banners:
 1. Identify DC candidates (host advertised the domain AND has LDAP+SMB open, when `--nmap` is on).
 2. Pick the best domain credential available.
@@ -501,6 +503,7 @@ Most-used flags at a glance:
 | `--no-reachability-check` | off | Skip the stdlib TCP-connect probe done when `--nmap` is off |
 | `--enum` | off | SMB enum probes into `loot/` |
 | `--modules` | — | Comma-separated nxc `-M` modules |
+| `--exam-safe` | off | Refuse to start if `--modules` lists an exploit module (OSCP-safe) |
 | `--bloodhound` | off | Auto-collect BloodHound per discovered domain |
 | `--bloodhound-force` | off | Bypass per-domain dedup |
 | `--bloodhound-ttl` | 86400 | Per-domain dedup window |

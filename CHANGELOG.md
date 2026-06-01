@@ -50,6 +50,20 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
   override, `_is_host_reachable` returning False for closed-port hosts,
   `reachability_check` flag plumbing. 166 → 184 total.
 
+### Added — `--exam-safe` module guardrail
+- **`--exam-safe`**: refuses to start (clean `parser.error()`, exit code 2)
+  when `--modules` contains an automated-exploitation module. The blocklist
+  (`EXAM_SAFE_BLOCKLIST` in `constants.py`) covers CVE-exploit and auth-coercion
+  modules — `zerologon`, `nopac`, `petitpotam`, `printnightmare`, `ms17-010`,
+  `smbghost`, `dfscoerce`, `shadowcoerce`, `coerce_plus` — while leaving
+  enumeration/collection modules (`spider_plus`, `gpp_password`, …) allowed.
+  Intended for OSCP-style exams where automated exploitation is prohibited.
+  Matching is case-insensitive and treats `-`/`_` as equivalent, so
+  `MS17-010` and `ms17_010` both trip the gate. The offending module names
+  are echoed back in the error so you know exactly what to drop. No effect
+  unless the flag is set. Four tests in `test_validation.py` cover the
+  refuse/allow/normalization/inert-without-flag paths.
+
 ### Fixed — BloodHound + domain-wide LDAP enum
 - **`--bloodhound` now picks the most-privileged credential** discovered
   during the spray, not whichever cred happened to validate first. The
