@@ -65,7 +65,7 @@ def render_startup_banner(width: int = 70) -> str:
     # Block letters paired with the meta lines on the right.
     meta_lines = [
         f"{CYAN}{BOLD}⚡ NetExec Automator{RESET}",
-        f"{DIM}auto-pwn AD in one command{RESET}",
+        f"{DIM}spray 'em all — auto-pwn AD{RESET}",
         "",
         f"{DIM}by Giovanni Rapa {CYAN}(@Givaa){RESET}",
         f"{DIM}github.com/Givaa/netexec-automator{RESET}",

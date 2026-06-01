@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Givaa/netexec-automator/actions/workflows/ci.yml/badge.svg)](https://github.com/Givaa/netexec-automator/actions/workflows/ci.yml)
 
-> *"One spray to rule them all."*
+> *"spray 'em all — auto-pwn AD."*
 >
 > Spray [NetExec](https://github.com/Pennyw0rth/NetExec) across **all 10 protocols** in parallel — with nmap pre-scan, hash & Kerberos auth, auto-enum, BloodHound collection, hash cracking, and a shell-pasteable commands transcript for your report.
 
@@ -498,6 +498,7 @@ Most-used flags at a glance:
 | `--skip-tried` | off | Skip (host, protocol, scope, user, secret) combinations already attempted in a previous run. Successes are always skipped on re-runs. |
 | `--rerun-after` | `0` | With `--skip-tried`: re-attempt past *failures* older than this many seconds (0 = never) |
 | `--clear-tried-cache` | off | Wipe the tried-credentials cache and exit |
+| `--no-reachability-check` | off | Skip the stdlib TCP-connect probe done when `--nmap` is off |
 | `--enum` | off | SMB enum probes into `loot/` |
 | `--modules` | — | Comma-separated nxc `-M` modules |
 | `--bloodhound` | off | Auto-collect BloodHound per discovered domain |

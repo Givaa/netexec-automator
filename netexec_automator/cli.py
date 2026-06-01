@@ -91,8 +91,8 @@ examples:
 
 def _build_parser():
     parser = argparse.ArgumentParser(
-        description="Spray NetExec (nxc) across all 10 protocols in parallel — "
-                    "with nmap pre-scan, hash/Kerberos auth, auto-enum, and BloodHound collection.",
+        description="NetExec Automator — spray 'em all. Multi-protocol AD pwnage in one command "
+                    "(nmap pre-scan, hash/Kerberos auth, auto-enum, secretsdump, hashcat, BloodHound).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=EXAMPLES_EPILOG,
     )
@@ -167,6 +167,11 @@ def _build_parser():
     g_scan.add_argument("--clear-tried-cache", action="store_true",
                         help="Wipe the tried_creds table from the cache and exit. Use this when "
                              "you want --skip-tried to start fresh.")
+    g_scan.add_argument("--no-reachability-check", action="store_true",
+                        help="Skip the stdlib TCP-connect reachability probe done when --nmap is off. "
+                             "By default a quick probe to common ports decides whether a single-host "
+                             "target is alive; CIDR / range specs are never probed (they go through nmap "
+                             "or full spray).")
 
     # ----- Post-exploitation -----
     g_post = parser.add_argument_group("post-exploitation (runs only on valid creds)")
@@ -243,9 +248,9 @@ def _build_parser():
     # ----- Output / logging -----
     g_out = parser.add_argument_group("output & logging")
     g_out.add_argument("-o", "--output",
-                       help="Custom nxc --log file path (default: HH-MM-SS-mmm.txt).")
+                       help="Custom nxc --log file path (default: logs/HH-MM-SS-mmm.txt).")
     g_out.add_argument("--cmd-log",
-                       help="Path for the shell-quoted commands transcript (default: commands-HH-MM-SS-mmm.log).")
+                       help="Path for the shell-quoted commands transcript (default: logs/commands-HH-MM-SS-mmm.log).")
     g_out.add_argument("--no-cmd-log", action="store_true",
                        help="Disable the commands transcript file.")
     g_out.add_argument("-v", "--verbose", action="count", default=0,
@@ -260,6 +265,85 @@ def _build_parser():
                             "The run summary table is still shown.")
 
     return parser
+
+
+def _validate_args(args, parser):
+    """Fail-fast checks before we open the cache, spawn subprocesses, or do
+    any I/O. Anything user-supplied that's malformed should produce a
+    parser.error() (clean exit code 2, no Python traceback)."""
+    import os
+
+    def _file_must_exist(flag: str, value: str):
+        """Treat the value as a path only if it looks like one (contains '/'
+        or '\\' or starts with '~'). Bare names like 'admin' or 'rockyou.txt'
+        without a directory part can also be paths — accept those if they
+        exist on disk, else assume they were meant as literals."""
+        if value is None:
+            return
+        looks_like_path = (
+            os.sep in value or "/" in value or value.startswith("~")
+            or value.endswith((".txt", ".lst", ".toml"))
+        )
+        if not looks_like_path:
+            return
+        if not Path(value).expanduser().exists():
+            parser.error(f"{flag}: file not found: {value!r}")
+
+    # Path-or-literal arguments (the tool accepts both)
+    _file_must_exist("-t/--target",   args.target)
+    _file_must_exist("-u/--user",     args.user)
+    _file_must_exist("-p/--password", args.password)
+    _file_must_exist("-H/--hash",     args.nthash)
+
+    # Strictly file-only arguments
+    for flag, val in (
+        ("--combo",        args.combo),
+        ("--wordlist",     args.wordlist),
+        ("--crack-rules",  args.crack_rules),
+        ("--config",       args.config),
+    ):
+        if val and not Path(val).expanduser().exists():
+            parser.error(f"{flag}: file not found: {val!r}")
+
+    # Numeric ranges (argparse already enforces int/float types)
+    range_checks = [
+        ("--workers",            args.workers,            1, None),
+        ("--delay",              args.delay,              0, None),
+        ("--jitter",             args.jitter,             0, None),
+        ("--cache-ttl",          args.cache_ttl,          0, None),
+        ("--bloodhound-ttl",     args.bloodhound_ttl,     0, None),
+        ("--rerun-after",        args.rerun_after,        0, None),
+        ("--max-retry",          args.max_retry,          0, None),
+        ("--netexec-timeout",    args.netexec_timeout,    1, None),
+        ("--subprocess-timeout", args.subprocess_timeout, 1, None),
+        ("--crack-timeout",      args.crack_timeout,      1, None),
+        ("--resolve-timeout",    args.resolve_timeout,    0.1, None),
+    ]
+    for flag, value, lo, hi in range_checks:
+        if value is None:
+            continue
+        if value < lo or (hi is not None and value > hi):
+            bound = f">= {lo}" + (f" and <= {hi}" if hi is not None else "")
+            parser.error(f"{flag}: must be {bound} (got {value})")
+
+    # Mutual exclusion + 'you must provide one' — caught later by
+    # NxcAutomator._build_credentials but message there is better when we
+    # state it explicitly here.
+    if args.combo and (args.user or args.password or args.nthash):
+        parser.error("--combo cannot be combined with -u/-p/-H "
+                     "(combo lines carry the user already).")
+
+    # --cracker choice already validated by argparse choices=
+
+    # Sanity: cache-path's parent must exist (or be creatable)
+    if args.cache_path:
+        cp = Path(args.cache_path).expanduser()
+        if cp.exists() and not cp.is_file():
+            parser.error(f"--cache-path: not a regular file: {cp}")
+
+    # If --update-nxc or --clear-tried-cache were the user's intent they
+    # should have been handled earlier; reaching here means -t is required.
+    # (This is enforced separately in main() after _validate_args.)
 
 
 def _apply_low_power_defaults(args):
@@ -284,10 +368,12 @@ def _merge_toml_into_args(args, parser):
     we only override values left at their argparse default."""
     if not args.config:
         return args
+    if not Path(args.config).expanduser().exists():
+        parser.error(f"--config: file not found: {args.config!r}")
     try:
         cfg = _load_toml_config(args.config)
     except Exception as exc:
-        raise SystemExit(f"{RED}Error reading --config {args.config}: {exc}{RESET}")
+        parser.error(f"--config: failed to parse {args.config!r}: {exc}")
     defaults = parser.parse_args([])  # what argparse would set with no CLI flags
     for key, value in cfg.items():
         key_attr = key.replace("-", "_")
@@ -351,6 +437,7 @@ def main():
 
     args = _merge_toml_into_args(args, parser)
     args = _apply_low_power_defaults(args)
+    _validate_args(args, parser)
     if args.workers is None:
         args.workers = DEFAULT_WORKERS
     nmap_enabled = args.nmap or args.scan_only
@@ -408,6 +495,7 @@ def main():
             no_banner=args.no_banner,
             skip_tried=args.skip_tried,
             rerun_after=args.rerun_after,
+            reachability_check=not args.no_reachability_check,
         )
         runner.run()
     except ValueError as exc:

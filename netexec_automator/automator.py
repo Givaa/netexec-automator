@@ -40,7 +40,7 @@ from .loot import LootStore
 from .resolver import HostnameResolver
 from .scanner import NmapScanner
 from .types import Credential, NxcActionResult
-from ._utils import _term_width, _truncate_path
+from ._utils import _term_width, _truncate_path, _truncate_text
 
 
 class NxcAutomator:
@@ -96,6 +96,7 @@ class NxcAutomator:
         no_banner: bool = False,
         skip_tried: bool = False,
         rerun_after: int = 0,
+        reachability_check: bool = True,
     ):
         self.targets = self._read_value_or_file(target)
         self.mode = mode.lower()
@@ -129,11 +130,19 @@ class NxcAutomator:
         self.completed = 0
         self.total_tasks = 0
         ts = datetime.now().strftime("%H-%M-%S-%f")[:-3]
-        self.log_file = output if output else f"{ts}.txt"
+        # Default log dir: ./logs/ — keeps the cwd tidy. Created lazily so the
+        # tool still works in read-only / unwriteable cwds (the writes fail
+        # gracefully with a recorded error instead of a stack trace).
+        logs_dir = Path("logs")
+        try:
+            logs_dir.mkdir(exist_ok=True)
+        except OSError:
+            logs_dir = Path(".")  # fall back to cwd
+        self.log_file = output if output else str(logs_dir / f"{ts}.txt")
         if cmd_log_disabled:
             self.cmd_log_path: Path | None = None
         else:
-            self.cmd_log_path = Path(cmd_log) if cmd_log else Path(f"commands-{ts}.log")
+            self.cmd_log_path = Path(cmd_log) if cmd_log else logs_dir / f"commands-{ts}.log"
         self._cmd_log_initialized = False
 
         self.verbosity = verbosity
@@ -183,6 +192,7 @@ class NxcAutomator:
         self.skip_tried = skip_tried
         self.rerun_after = max(0, int(rerun_after))
         self.skipped_already_tried = 0  # counter for the FINAL REPORT
+        self.reachability_check = reachability_check
         self.strict_errors: list[str] = []
 
         # Cross-host state populated during the run.
@@ -849,15 +859,18 @@ class NxcAutomator:
 
     def _cfg_row(self, k1: str, v1: str, k2: str | None, v2: str | None) -> str:
         """Render one config-table row, padded so the right edge lands at
-        exactly _BANNER_WIDTH columns regardless of wide-emoji or ANSI."""
-        # Total budget for a single-column row's value:
-        #   inner = _BANNER_WIDTH - 2 (lead) - KEY_W - 3 (" │ ")
+        exactly _BANNER_WIDTH columns regardless of wide-emoji or ANSI.
+
+        Uses _truncate_text (which counts visible columns including wide
+        emoji) so banner cells like 'Composition: 3 pwd · 2 hash · 3 anon
+        (null/guest)' or a comma-separated modules list don't slip off
+        the grid when they exceed the cell budget."""
         if k2 is None:
             v1_budget = self._BANNER_WIDTH - 2 - self._CFG_KEY_W - 3
-            v1_clip = _truncate_path(v1, budget=v1_budget)
+            v1_clip = _truncate_text(v1, v1_budget)
             return f"  {self._pad_visible(k1, self._CFG_KEY_W)} {DIM}│{RESET} {BOLD}{self._pad_visible(v1_clip, v1_budget)}{RESET}"
-        v1_clip = _truncate_path(v1, budget=self._CFG_VAL_W)
-        v2_clip = _truncate_path(v2, budget=self._CFG_VAL2_W)
+        v1_clip = _truncate_text(v1, self._CFG_VAL_W)
+        v2_clip = _truncate_text(v2, self._CFG_VAL2_W)
         return (
             f"  {self._pad_visible(k1, self._CFG_KEY_W)} {DIM}│{RESET} "
             f"{BOLD}{self._pad_visible(v1_clip, self._CFG_VAL_W)}{RESET} "
@@ -1049,6 +1062,51 @@ class NxcAutomator:
     # ---------------------------------------------------------------
     # Post-exploitation: DC detection, enum/modules, BloodHound
     # ---------------------------------------------------------------
+
+    @staticmethod
+    def _is_host_reachable(host: str, ports: tuple[int, ...] = (445, 22, 3389, 80, 139), timeout: float = 2.0) -> bool:
+        """Stdlib-only TCP connect probe — try a small set of common ports
+        with a short timeout, return True as soon as one accepts. Used as
+        a default reachability check when --nmap is off so we don't waste
+        15 worker-minutes spraying a dead /24.
+
+        The port list is deliberately broad (SMB, SSH, RDP, HTTP, NetBIOS)
+        because the spray covers more than just AD."""
+        import socket
+        for port in ports:
+            try:
+                sock = socket.create_connection((host, port), timeout=timeout)
+                sock.close()
+                return True
+            except (OSError, socket.timeout):
+                continue
+        return False
+
+    def _bulk_probe_smb_banners(self, hosts_with_ports: dict[str, set[int]]):
+        """Run _probe_smb_banner concurrently across all known-alive hosts.
+
+        Without this, the per-host SMB info probe happened serially right
+        before each host's spray header — adding ~5s × N hosts of dead
+        wall-clock time. Now they run in a small thread pool while the
+        spray pool warms up, so the first host header appears immediately."""
+        candidates = [
+            h for h, ports in hosts_with_ports.items()
+            if (not ports or 445 in ports or 139 in ports)
+            and h not in self.host_names  # don't re-probe cached
+        ]
+        if not candidates:
+            return
+        with ThreadPoolExecutor(max_workers=min(20, len(candidates))) as pool:
+            futures = {
+                pool.submit(self._probe_smb_banner, h, hosts_with_ports.get(h)): h
+                for h in candidates
+            }
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    self._vprint(V_VERBOSE,
+                                 f"  {DIM}probe failed for {futures[fut]}: {exc}{RESET}")
 
     def _probe_smb_banner(self, host: str, open_ports: set[int] | None = None):
         """Quick SMB banner probe to populate host_names / host_domain BEFORE
@@ -1756,12 +1814,23 @@ class NxcAutomator:
     def _discover_target(self, target: str) -> dict[str, set[int]]:
         """Resolve a target spec into {host: {open_ports}}.
 
-        Without --nmap, returns {target: set()} (signals 'no filtering').
-        With --nmap, runs scan (cache-aware for single hosts) and returns
-        only hosts with at least one open port.
+        Without --nmap, returns {target: set()} unless --reachability-check
+        is on (default) and a stdlib TCP probe to a small set of common
+        ports times out — in which case the target is treated as dead and
+        skipped, sparing the spray of ~15 worker-minutes per dead /24.
+
+        With --nmap, runs the full scan (cache-aware for single hosts) and
+        returns only hosts with at least one open port.
         """
         if not self.nmap_enabled or self.scanner is None:
-            return {target: set()}
+            # CIDR / range specs can't be TCP-probed as a unit — let them through.
+            if not self.reachability_check or self._is_expandable_spec(target):
+                return {target: set()}
+            if self._is_host_reachable(target):
+                return {target: set()}
+            # Treat as dead; the caller records it in self.dead_hosts.
+            self._vprint(V_VERBOSE, f"  {DIM}↷ {target} unreachable (TCP probe failed) — skipped{RESET}")
+            return {}
 
         expandable = self._is_expandable_spec(target)
 
@@ -1895,23 +1964,34 @@ class NxcAutomator:
         if self.verbosity > V_QUIET:
             self._print_scan_banner(total_attempts)
 
-        try:
-            for raw_target in self.targets:
-                discovered = self._discover_target(raw_target)
+        # Discover everything up-front so we can run the SMB banner probes
+        # in parallel across all live hosts (the previous code did them
+        # serially right before each host's spray, adding ~5s × N hosts).
+        all_discovered: list[tuple[str, dict[str, set[int]]]] = []
+        for raw_target in self.targets:
+            discovered = self._discover_target(raw_target)
+            if not discovered:
+                msg = "no open ports / unreachable" if self.nmap_enabled else "unreachable"
+                self.dead_hosts.append(raw_target)
+                if self.verbosity > V_QUIET:
+                    print(f"  {DIM}► {raw_target} — {msg}{RESET}\n")
+                continue
+            all_discovered.append((raw_target, discovered))
 
-                if not discovered:
-                    msg = "no open ports / unreachable" if self.nmap_enabled else "no targets"
-                    self.dead_hosts.append(raw_target)
-                    if self.verbosity > V_QUIET:
-                        print(f"  {DIM}► {raw_target} — {msg}{RESET}\n")
-                    continue
+        # Parallel SMB-banner sweep: every live host has its name/domain ready
+        # before its header is printed below — no per-host startup latency.
+        live_hosts: dict[str, set[int]] = {}
+        for _, disc in all_discovered:
+            for host, ports in disc.items():
+                live_hosts[host] = ports if self.nmap_enabled else set()
+        if live_hosts:
+            self._bulk_probe_smb_banners(live_hosts)
+
+        try:
+            for raw_target, discovered in all_discovered:
 
                 for host, open_ports in discovered.items():
                     tasks = self._build_protocol_tasks(open_ports if self.nmap_enabled else None)
-
-                    # Cheap SMB probe so the live header can show the AD name+domain
-                    # (DC01.corp.local) right next to the IP, not just in the final report.
-                    self._probe_smb_banner(host, open_ports if self.nmap_enabled else None)
 
                     if self.verbosity > V_QUIET:
                         hostname = self._resolved_hostname(host)

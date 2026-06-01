@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# netexec-automator runtime artefacts
+logs/
+loot/
+
 # C extensions
 *.so
 

@@ -9,6 +9,47 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 
 ## [Unreleased]
 
+### Changed — UX, validation, performance polish
+- **`logs/` directory by default**: nxc `--log` and the commands transcript
+  now land in `./logs/HH-MM-SS-mmm.txt` and `./logs/commands-HH-MM-SS-mmm.log`
+  instead of cluttering the cwd. The dir is created lazily; if the cwd is
+  read-only the tool falls back to `.` so the run isn't blocked.
+- **Fail-fast input validation** (`_validate_args` in `cli.py`): every
+  user-supplied path is checked for existence (`--combo`, `--wordlist`,
+  `--crack-rules`, `--config`, and `-t / -u / -p / -H` when they look
+  path-like) and every numeric flag is range-checked. Failures produce a
+  clean `parser.error()` (exit code 2 with a single-line message) instead
+  of a mid-spray Python traceback. `--config` parse errors also route
+  through `parser.error()` for a uniform UX.
+- **Tagline refresh**: argparse description and banner subtitle now read
+  `spray 'em all — auto-pwn AD` instead of `auto-pwn AD in one command`.
+- **Banner table truncation**: cells with non-path values (e.g.
+  `Post-exploit: enum(smb+ldap) · modules=spider_plus,gpp_password,…`)
+  used to overflow the column budget on narrow terminals. New
+  `_truncate_text` helper counts visible columns (ANSI-stripped + wide-
+  emoji aware) and appends an ellipsis when the cell would otherwise slip
+  off-grid. The right border now lands at column 72 regardless of input
+  length.
+- **Reachability TCP pre-check** when `--nmap` is off: single-host targets
+  go through a stdlib `socket.create_connection()` probe to a short list
+  of common ports (445, 22, 3389, 80, 139) with a 2 s timeout. Hosts that
+  reject every probe are added to `dead_hosts` instead of being sprayed
+  for ~15 worker-minutes. CIDR / range specs are never TCP-probed (they
+  go through nmap or the full spray path). Opt out with
+  `--no-reachability-check`.
+- **Parallel SMB banner sweep** before the spray: previously each host's
+  `_probe_smb_banner` ran serially right before its header was printed,
+  adding ~5 s × N hosts of dead wall-clock latency. Now all discovered
+  live hosts are probed concurrently (up to 20 workers) so the first
+  header appears immediately.
+- 18 new pytest cases in `tests/test_validation.py` covering: missing
+  files for `--combo` / `--wordlist` / `--config` / path-like `-t`,
+  range checks (`--workers 0`, `--delay -1`), `--combo` + `-u` mutual
+  exclusion, `_truncate_text` semantics including wide-emoji budgeting,
+  `logs/` default paths, `--no-cmd-log` disabling, custom `--cmd-log`
+  override, `_is_host_reachable` returning False for closed-port hosts,
+  `reachability_check` flag plumbing. 166 → 184 total.
+
 ### Fixed — BloodHound + domain-wide LDAP enum
 - **`--bloodhound` now picks the most-privileged credential** discovered
   during the spray, not whichever cred happened to validate first. The

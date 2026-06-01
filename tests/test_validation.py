@@ -1,0 +1,187 @@
+"""Tests for the input-validation layer in cli._validate_args, plus the
+logs/ dir defaults, the _truncate_text helper, and the reachability probe."""
+
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+TOOL = Path(__file__).resolve().parent.parent / "netexec-automator.py"
+
+
+def run_tool(args, env=None, cwd=None):
+    import os
+    py_env = (env or os.environ).copy()
+    py_dir = str(Path(sys.executable).parent)
+    py_env.setdefault("PATH", f"{py_dir}:/usr/bin:/bin")
+    proc = subprocess.run(
+        ["python3", str(TOOL), *args],
+        env=py_env, cwd=str(cwd) if cwd else None,
+        capture_output=True, text=True, timeout=15,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+# ---- _validate_args: file existence --------------------------------------
+
+def test_combo_missing_file_errors_cleanly(tmp_path):
+    rc, _, err = run_tool(
+        ["-t", "10.0.0.5", "--combo", str(tmp_path / "nope.txt"), "--no-cmd-log"],
+        cwd=tmp_path,
+    )
+    assert rc == 2  # parser.error exits 2
+    assert "--combo" in err and "file not found" in err.lower()
+
+
+def test_wordlist_missing_file_errors_cleanly(tmp_path):
+    rc, _, err = run_tool(
+        ["-t", "10.0.0.5", "-u", "u", "-p", "p",
+         "--crack", "--wordlist", str(tmp_path / "missing-wordlist.txt"),
+         "--no-cmd-log"],
+        cwd=tmp_path,
+    )
+    assert rc == 2
+    assert "--wordlist" in err
+    assert "file not found" in err.lower()
+
+
+def test_config_missing_file_errors_cleanly(tmp_path):
+    rc, _, err = run_tool(
+        ["-t", "10.0.0.5", "--config", str(tmp_path / "no.toml"), "--no-cmd-log"],
+        cwd=tmp_path,
+    )
+    assert rc == 2
+    assert "--config" in err
+
+
+def test_target_with_slash_must_exist(tmp_path):
+    """If -t looks like a path (slash in name) it must resolve to a file."""
+    rc, _, err = run_tool(
+        ["-t", str(tmp_path / "missing-targets.txt"), "-u", "u", "-p", "p",
+         "--no-cmd-log"],
+        cwd=tmp_path,
+    )
+    assert rc == 2
+    assert "-t" in err or "target" in err.lower()
+
+
+def test_bare_ip_target_does_not_trigger_file_check(tmp_path):
+    """'10.0.0.5' shouldn't be treated as a path; the run must proceed to
+    the next gate (which exits because nxc isn't in PATH)."""
+    import os
+    env = os.environ.copy()
+    env["PATH"] = f"{Path(sys.executable).parent}:/usr/bin:/bin"
+    rc, out, err = run_tool(
+        ["-t", "10.0.0.5", "-u", "u", "-p", "p", "--no-cmd-log"],
+        env=env, cwd=tmp_path,
+    )
+    combined = out + err
+    # We should reach the nxc pre-flight, not the path validator
+    assert "nxc not found" in combined.lower() or rc != 2
+    assert "file not found" not in combined.lower()
+
+
+# ---- _validate_args: numeric ranges -------------------------------------
+
+def test_negative_workers_rejected(tmp_path):
+    rc, _, err = run_tool(
+        ["-t", "10.0.0.5", "-u", "u", "-p", "p", "-w", "0", "--no-cmd-log"],
+        cwd=tmp_path,
+    )
+    assert rc == 2
+    assert "--workers" in err
+    assert "got 0" in err
+
+
+def test_negative_delay_rejected(tmp_path):
+    rc, _, err = run_tool(
+        ["-t", "10.0.0.5", "-u", "u", "-p", "p", "--delay", "-1", "--no-cmd-log"],
+        cwd=tmp_path,
+    )
+    assert rc == 2
+    assert "--delay" in err
+
+
+def test_combo_with_user_is_rejected(tmp_path):
+    """--combo carries the user already; -u with --combo is ambiguous."""
+    combo = tmp_path / "c.txt"
+    combo.write_text("admin:pwd\n")
+    rc, _, err = run_tool(
+        ["-t", "10.0.0.5", "--combo", str(combo), "-u", "admin", "--no-cmd-log"],
+        cwd=tmp_path,
+    )
+    assert rc == 2
+    assert "--combo" in err
+
+
+# ---- _truncate_text -----------------------------------------------------
+
+def test_truncate_text_within_budget(nxa):
+    from netexec_automator._utils import _truncate_text
+    assert _truncate_text("short", 10) == "short"
+
+
+def test_truncate_text_over_budget_adds_ellipsis(nxa):
+    from netexec_automator._utils import _truncate_text
+    s = "this is a fairly long config value that won't fit in 20 cols"
+    out = _truncate_text(s, 20)
+    # End with the ellipsis and be <= 20 visible cols
+    from netexec_automator.banner import _visible_len
+    assert out.endswith("…")
+    assert _visible_len(out) <= 20
+
+
+def test_truncate_text_counts_wide_emoji(nxa):
+    from netexec_automator._utils import _truncate_text
+    from netexec_automator.banner import _visible_len
+    # Each emoji is 2 cols; '⚡⚡⚡⚡⚡' is 10 visible cols
+    out = _truncate_text("⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡", 5)  # budget=5 → 2 emoji + …
+    assert _visible_len(out) <= 5
+
+
+# ---- logs/ default -------------------------------------------------------
+
+def test_default_log_paths_land_in_logs_dir(nxa, tmp_path):
+    a = nxa.NxcAutomator(target="x", user="u", password="p")
+    # Path stored as string; just check the parent directory name
+    assert "logs" in a.log_file
+    assert a.cmd_log_path is not None
+    assert a.cmd_log_path.parent.name == "logs"
+
+
+def test_no_cmd_log_disables_path(nxa):
+    a = nxa.NxcAutomator(target="x", user="u", password="p", cmd_log_disabled=True)
+    assert a.cmd_log_path is None
+
+
+def test_custom_cmd_log_overrides_default(nxa, tmp_path):
+    custom = tmp_path / "myrun.log"
+    a = nxa.NxcAutomator(target="x", user="u", password="p", cmd_log=str(custom))
+    assert a.cmd_log_path == custom
+
+
+# ---- Reachability TCP probe ---------------------------------------------
+
+def test_is_host_reachable_returns_bool(nxa):
+    """Just verify the method runs and returns a bool — the actual
+    connectivity outcome depends on the test host's network."""
+    result = nxa.NxcAutomator._is_host_reachable("127.0.0.1", ports=(1,), timeout=0.5)
+    assert isinstance(result, bool)
+
+
+def test_is_host_reachable_unreachable_port(nxa):
+    """Pick a port that's almost certainly closed on localhost. Should
+    return False within the timeout."""
+    # Port 1 is reserved and almost never listening; bind() requires root.
+    assert nxa.NxcAutomator._is_host_reachable("127.0.0.1", ports=(1,), timeout=0.5) is False
+
+
+def test_reachability_check_default_on(nxa):
+    a = nxa.NxcAutomator(target="x", user="u", password="p")
+    assert a.reachability_check is True
+
+
+def test_reachability_check_opt_out(nxa):
+    a = nxa.NxcAutomator(target="x", user="u", password="p", reachability_check=False)
+    assert a.reachability_check is False
