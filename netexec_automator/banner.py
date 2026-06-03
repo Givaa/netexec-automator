@@ -5,6 +5,8 @@ curated pool of one-liners that nod at the multi-protocol nature of the
 tool (LOTR, Hackers, WarGames, …). Cheap dopamine for the operator."""
 
 import random
+import re
+import unicodedata
 
 from .constants import (BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW)
 
@@ -98,14 +100,15 @@ def render_startup_banner(width: int = 70) -> str:
 # wide in every modern terminal).
 _FORCE_WIDE = set("⚡💀🩸🧪🔓📋💾⚠⏱")
 
+# Precompiled once at import: _visible_len runs per banner/table row, so we
+# avoid re-parsing this pattern on every call.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
 
 def _visible_len(s: str) -> int:
     """Length of `s` as the terminal will render it: ANSI escapes contribute
     zero columns, wide emoji contribute two, everything else one."""
-    import re
-    import unicodedata
-
-    s = re.sub(r"\x1b\[[0-9;]*m", "", s)
+    s = _ANSI_RE.sub("", s)
     w = 0
     for ch in s:
         if ch in _FORCE_WIDE:
