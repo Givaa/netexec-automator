@@ -226,6 +226,96 @@ def test_is_host_reachable_unreachable_port(nxa):
     assert nxa.NxcAutomator._is_host_reachable("127.0.0.1", ports=(1,), timeout=0.5) is False
 
 
+def test_is_host_reachable_true_for_listening_port(nxa):
+    """A real listening socket on localhost must be detected as reachable,
+    even when mixed with closed ports."""
+    import socket
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    try:
+        assert nxa.NxcAutomator._is_host_reachable(
+            "127.0.0.1", ports=(1, port, 2), timeout=2.0
+        ) is True
+    finally:
+        srv.close()
+
+
+def test_is_host_reachable_empty_ports_is_false(nxa):
+    """Empty port tuple must return False (not raise), matching the old
+    sequential loop's no-op fall-through."""
+    assert nxa.NxcAutomator._is_host_reachable("127.0.0.1", ports=(), timeout=0.5) is False
+
+
+def test_is_host_reachable_probes_all_resolved_addresses(nxa, monkeypatch):
+    """Regression: a dual-stack name whose FIRST (IPv6) address is dead but
+    whose IPv4 address listens must still be reachable — create_connection
+    tried every resolved address, so must we. Guards against pinning to
+    getaddrinfo()[0] (which silently dropped live IPv4-only hosts)."""
+    import socket
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    live_port = srv.getsockname()[1]
+
+    real_gai = socket.getaddrinfo
+
+    def fake_gai(host, port, *args, **kwargs):
+        if host == "dualstack.test":
+            # IPv6 ::1 on a dead port FIRST, then the live IPv4 listener.
+            return [
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 1, 0, 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", live_port)),
+            ]
+        return real_gai(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_gai)
+    try:
+        assert nxa.NxcAutomator._is_host_reachable(
+            "dualstack.test", ports=(live_port,), timeout=2.0
+        ) is True
+    finally:
+        srv.close()
+
+
+def test_is_host_reachable_dead_host_is_parallel(nxa):
+    """A dead host with several filtered ports must return False bounded by
+    ~one timeout (probes run in parallel), not len(ports) × timeout. Uses an
+    RFC5737 TEST-NET-1 address that is never routed. Lenient bound: a
+    reversion to sequential per-port waits (~5 × timeout) would blow past it."""
+    import time
+    ports = (445, 22, 3389, 80, 139)
+    timeout = 0.5
+    t0 = time.monotonic()
+    result = nxa.NxcAutomator._is_host_reachable("192.0.2.1", ports=ports, timeout=timeout)
+    elapsed = time.monotonic() - t0
+    assert result is False
+    assert elapsed < timeout * 3, f"probe took {elapsed:.2f}s — not running in parallel?"
+
+
+def test_is_host_reachable_leaves_no_worker_threads(nxa):
+    """Regression: the probe must not spawn/leak worker threads. The previous
+    ThreadPoolExecutor version left losing connect threads blocked for the
+    full timeout (joined by concurrent.futures' atexit hook, stalling exit and
+    piling up across the discovery loop). The selector-based probe uses none."""
+    import socket
+    import threading
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    try:
+        before = threading.active_count()
+        assert nxa.NxcAutomator._is_host_reachable(
+            "127.0.0.1", ports=(port, 1, 2), timeout=2.0
+        ) is True
+        # No threads created → count is unchanged the instant we return.
+        assert threading.active_count() == before
+    finally:
+        srv.close()
+
+
 def test_reachability_check_default_on(nxa):
     a = nxa.NxcAutomator(target="x", user="u", password="p")
     assert a.reachability_check is True

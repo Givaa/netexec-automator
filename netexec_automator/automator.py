@@ -1071,16 +1071,95 @@ class NxcAutomator:
         15 worker-minutes spraying a dead /24.
 
         The port list is deliberately broad (SMB, SSH, RDP, HTTP, NetBIOS)
-        because the spray covers more than just AD."""
+        because the spray covers more than just AD.
+
+        Thread-free: non-blocking connects driven by a selector, with every
+        socket closed before returning. We probe EVERY address getaddrinfo
+        returns (both families) across all ports at once — exactly like
+        socket.create_connection's all-addresses fallback — so a dual-stack
+        name whose first (often IPv6) address is dead but whose IPv4 address
+        listens is still seen as reachable; pinning to the first resolved
+        address would silently drop such live hosts from the spray. A live
+        host returns the instant any port accepts; a dead host costs ~one
+        `timeout` total instead of len(ports) × timeout. Any socket-level
+        error is treated as 'unreachable' rather than raised, so one bad
+        target can't abort the whole discovery loop."""
+        import errno
+        import selectors
         import socket
+
+        if not ports:
+            return False  # mirror the old `for port in ports` no-op → False
+
+        # Every (family, sockaddr) for every port. getaddrinfo builds the
+        # correct sockaddr per family (incl. IPv6 flow/scope info), and we
+        # keep ALL of them so multi-homed / dual-stack hosts are fully probed.
+        targets: list[tuple[int, tuple]] = []
         for port in ports:
             try:
-                sock = socket.create_connection((host, port), timeout=timeout)
-                sock.close()
-                return True
-            except (OSError, socket.timeout):
-                continue
-        return False
+                for family, _st, _pr, _cn, sockaddr in socket.getaddrinfo(
+                    host, port, type=socket.SOCK_STREAM
+                ):
+                    targets.append((family, sockaddr))
+            except OSError:
+                continue  # this lookup failed — another port/family may resolve
+        if not targets:
+            return False  # nothing resolvable → unreachable
+
+        # errno values meaning "connect in flight": POSIX EINPROGRESS, the
+        # Windows WSA equivalents, plus EWOULDBLOCK for good measure.
+        pending = {errno.EINPROGRESS, errno.EWOULDBLOCK}
+        for _name in ("WSAEINPROGRESS", "WSAEWOULDBLOCK"):
+            code = getattr(errno, _name, None)
+            if code is not None:
+                pending.add(code)
+
+        sel = selectors.DefaultSelector()
+        socks: list[socket.socket] = []
+        try:
+            for family, sockaddr in targets:
+                try:
+                    sock = socket.socket(family, socket.SOCK_STREAM)
+                    sock.setblocking(False)
+                    socks.append(sock)
+                    rc = sock.connect_ex(sockaddr)
+                except OSError:
+                    continue                # couldn't start this probe — try the rest
+                if rc == 0:
+                    return True             # connected immediately (e.g. localhost)
+                if rc in pending:
+                    sel.register(sock, selectors.EVENT_WRITE)
+                # any other rc → refused/dead at once: just skip this socket
+            deadline = time.monotonic() + timeout
+            while sel.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False            # ran out the clock with nothing up
+                try:
+                    ready = sel.select(remaining)
+                except OSError:
+                    return False
+                if not ready:
+                    return False
+                for key, _mask in ready:
+                    s = key.fileobj
+                    # A writable non-blocking connect is either done or failed;
+                    # SO_ERROR == 0 means the handshake actually completed.
+                    try:
+                        err = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    except OSError:
+                        err = 1             # broken socket → treat as failed
+                    if err == 0:
+                        return True
+                    sel.unregister(s)       # this one refused — keep waiting on the rest
+            return False
+        finally:
+            sel.close()
+            for s in socks:
+                try:
+                    s.close()
+                except OSError:
+                    pass
 
     def _bulk_probe_smb_banners(self, hosts_with_ports: dict[str, set[int]]):
         """Run _probe_smb_banner concurrently across all known-alive hosts.
