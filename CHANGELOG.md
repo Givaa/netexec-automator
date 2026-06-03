@@ -31,17 +31,32 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
   off-grid. The right border now lands at column 72 regardless of input
   length.
 - **Reachability TCP pre-check** when `--nmap` is off: single-host targets
-  go through a stdlib `socket.create_connection()` probe to a short list
-  of common ports (445, 22, 3389, 80, 139) with a 2 s timeout. Hosts that
-  reject every probe are added to `dead_hosts` instead of being sprayed
-  for ~15 worker-minutes. CIDR / range specs are never TCP-probed (they
-  go through nmap or the full spray path). Opt out with
-  `--no-reachability-check`.
+  are probed on a short list of common ports (445, 22, 3389, 80, 139); a
+  host that rejects every probe is added to `dead_hosts` instead of being
+  sprayed for ~15 worker-minutes. CIDR / range specs are never TCP-probed
+  (they go through nmap or the full spray path). Opt out with
+  `--no-reachability-check`. The probe fires non-blocking connects across
+  every resolved address (both families, like `socket.create_connection`'s
+  all-addresses fallback) at once via a `selectors` loop and returns on the
+  first accept — so a dead host costs ~one timeout instead of
+  len(ports) × timeout, and a live host stays instant. Thread-free by
+  design: a thread pool would strand losing connect threads (joined at
+  interpreter exit, stalling it) that pile up across the per-target
+  discovery loop. +5 regression tests cover the all-addresses fallback,
+  the parallel-timeout bound, and zero thread leakage.
 - **Parallel SMB banner sweep** before the spray: previously each host's
   `_probe_smb_banner` ran serially right before its header was printed,
   adding ~5 s × N hosts of dead wall-clock latency. Now all discovered
   live hosts are probed concurrently (up to 20 workers) so the first
   header appears immediately.
+- **SQLite cache runs in WAL mode** (`journal_mode=WAL` +
+  `synchronous=NORMAL`): cache readers (spray workers calling `get_fresh` /
+  `was_tried`) no longer block the single writer — the prerequisite for
+  spraying hosts in parallel off a shared cache. `NORMAL` sync is durable
+  enough for a regenerable cache and saves one fsync per commit.
+- **`_visible_len` precompiles its ANSI-escape regex** and hoists the
+  `re` / `unicodedata` imports out of the per-call path (it runs once per
+  banner / table row). Output is byte-identical — purely a per-call cost cut.
 - 18 new pytest cases in `tests/test_validation.py` covering: missing
   files for `--combo` / `--wordlist` / `--config` / path-like `-t`,
   range checks (`--workers 0`, `--delay -1`), `--combo` + `-u` mutual
