@@ -66,6 +66,13 @@ class HostCache:
         # SQLite itself serializes writes; we add a Python-level lock to keep
         # multi-statement sequences (e.g. clear_tried_cache) atomic.
         self._conn = sqlite3.connect(str(self.path), timeout=30, check_same_thread=False)
+        # WAL lets cache readers (host-spray workers checking get_fresh/was_tried)
+        # proceed without blocking the single writer, and vice-versa — the
+        # prerequisite for spraying hosts in parallel off a shared cache.
+        # NORMAL sync is durable enough for a regenerable cache and drops one
+        # fsync per commit. Both PRAGMAs are idempotent and persist in the file.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._lock = Lock()
         self._conn.executescript(self.SCHEMA)
         self._conn.commit()
