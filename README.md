@@ -492,15 +492,21 @@ Most-used flags at a glance:
 | `-k, --kerberos` | off | Use ccache via `KRB5CCNAME` |
 | `--combo` | — | `user:secret` combo file (auto-detects pwd vs hash) |
 | `--null-session` | off | Prepend null/Guest/anonymous attempts |
-| `--nmap` | off | Port pre-scan; only spray protocols with open ports |
-| `--scan-only` | off | Pre-scan only, no auth attempts |
+| nmap pre-scan | **on** | Port pre-scan is on by default; only protocols with open ports are sprayed, and open ports are cached per host and reused |
+| `--no-nmap` | off | Disable the pre-scan and spray every protocol on every target (the old default) |
+| `--nmap` | — | Deprecated no-op (pre-scan is on by default now) |
+| `--scan-only` | off | Pre-scan only, no auth attempts (forces the pre-scan on) |
+| `--rescan` | off | Ignore cached scan results for the targets: re-check liveness and re-run nmap from scratch |
 | `--no-cache` | off | Bypass SQLite cache |
-| `--cache-ttl` | 86400 | Nmap cache validity in seconds |
+| `--cache-ttl` | 86400 | Open-port cache validity in seconds (24h) |
+| `--dead-ttl` | 3600 | Shorter validity for "host dead / no open ports" (1h); dead hosts are also re-probed for liveness every run |
 | `--cache-path` | `~/.cache/...` | Custom SQLite cache path (isolate parallel/CI runs) |
-| `--skip-tried` | off | Skip (host, protocol, scope, user, secret) combinations already attempted in a previous run. Successes are always skipped on re-runs. |
-| `--rerun-after` | `0` | With `--skip-tried`: re-attempt past *failures* older than this many seconds (0 = never) |
+| incremental spray | **on** | Prior (host, protocol, scope, user, secret) attempts are remembered and skipped; only new combinations are sprayed. Successes/(Pwn3d!) always skipped on re-runs |
+| `--retry-all` | off | Re-spray every combination even if already tried (alias `--no-skip-tried`) |
+| `--skip-tried` | — | Deprecated no-op (incremental spray is on by default now) |
+| `--rerun-after` | `0` | Re-attempt past *failures* older than this many seconds (0 = never) |
 | `--clear-tried-cache` | off | Wipe the tried-credentials cache and exit |
-| `--no-reachability-check` | off | Skip the stdlib TCP-connect probe done when `--nmap` is off |
+| `--no-reachability-check` | off | Skip the stdlib TCP-connect probe (used to gate dead-host re-scan and the no-nmap path) |
 | `--enum` | off | SMB enum probes into `loot/` |
 | `--modules` | — | Comma-separated nxc `-M` modules |
 | `--exam-safe` | off | Refuse to start if `--modules` lists an exploit module (OSCP-safe) |

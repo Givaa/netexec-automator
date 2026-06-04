@@ -9,6 +9,48 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 
 ## [Unreleased]
 
+### Changed — stateful, incremental discovery & spray
+The tool now remembers what it learned across runs and only redoes work on
+purpose. Four behaviour changes, each with an explicit opt-out:
+
+- **nmap pre-scan is on by default.** The first run scans open ports per host,
+  caches them, and reuses them on later runs (only protocols whose ports are
+  open get sprayed). `--no-nmap` restores the old spray-everything behaviour;
+  `--nmap` is now a deprecated no-op; `--scan-only` still forces it. nmap-missing
+  still degrades gracefully to no pre-scan.
+- **Incremental spray is on by default.** Prior `(target, protocol, scope, user,
+  secret)` attempts are remembered and skipped, so a 100-credential file isn't
+  re-sprayed wholesale every run — only new combinations are tried. Successes /
+  `(Pwn3d!)` are always skipped on re-runs; failures stay skipped unless
+  `--rerun-after` fires. `--retry-all` (alias `--no-skip-tried`) forces a full
+  re-spray; `--skip-tried` is now a deprecated no-op.
+- **The cache distinguishes stable from volatile facts.** Open-port sets keep
+  the long `--cache-ttl` (24h); a "host dead / no open ports" result now expires
+  after the much shorter `--dead-ttl` (1h default). Before trusting a cached-dead
+  host, the discovery step re-probes liveness (the stdlib TCP connect) — so a
+  host that comes back online is re-scanned at once instead of staying skipped
+  for a day (honours `--no-reachability-check`).
+- **`--rescan`**: ignore cached scan results for the targets, re-check liveness,
+  and re-run nmap from scratch (the fresh result overwrites the cache).
+- **Per-IP cache reuse across ranges.** A CIDR up to /20 is expanded and only
+  the IPs we don't already know are nmap'd; cached open-port sets and fresh dead
+  sentinels are reused, and freshly-scanned results (including dead ones) are
+  stored per IP. Larger ranges and nmap dash-ranges fall back to a single full
+  nmap.
+- **Startup menu shows prior loot.** A "Prior loot" line summarises credentials
+  found valid in earlier runs for the current targets (`user@host`, Pwn3d
+  flagged), read from the cache. Secrets are never shown — only the hash is
+  persisted.
+- New cache APIs `invalidate()` and `list_valid()`; `NmapScanner.scan()` accepts
+  a list of targets; new `--dead-ttl` / `--rescan` / `--retry-all` flags.
+
+### Fixed
+- **`(hostname)` no longer disappears from the live header when `--nmap` is
+  off.** The parallel SMB-banner sweep passed an empty ports set to the probe,
+  whose "no SMB ports → skip" guard then skipped it, so the host name was never
+  resolved on networks without DNS PTR. The sweep now passes `None` ("ports
+  unknown, probe anyway").
+
 ### Changed — UX, validation, performance polish
 - **`logs/` directory by default**: nxc `--log` and the commands transcript
   now land in `./logs/HH-MM-SS-mmm.txt` and `./logs/commands-HH-MM-SS-mmm.log`
