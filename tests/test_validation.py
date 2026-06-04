@@ -16,7 +16,10 @@ def run_tool(args, env=None, cwd=None):
     py_dir = str(Path(sys.executable).parent)
     py_env.setdefault("PATH", f"{py_dir}:/usr/bin:/bin")
     proc = subprocess.run(
-        ["python3", str(TOOL), *args],
+        # sys.executable, not bare "python3": the latter can resolve to a
+        # system Python older than 3.10 that chokes on the codebase's
+        # `str | None` annotations (ImportError → exit 1, not the exit-2 we test).
+        [sys.executable, str(TOOL), *args],
         env=py_env, cwd=str(cwd) if cwd else None,
         capture_output=True, text=True, timeout=15,
     )

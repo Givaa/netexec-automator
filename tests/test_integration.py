@@ -7,6 +7,7 @@ progress bar, the --strict exit path, …)."""
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,9 @@ def env_with_mock(tmp_path):
 def run_tool(args, env, cwd, timeout=30):
     """Run the CLI and return (rc, stdout, stderr)."""
     proc = subprocess.run(
-        ["python3", str(TOOL), *args],
+        # sys.executable, not bare "python3" (which may resolve to a <3.10
+        # system Python that can't parse the codebase's `str | None` syntax).
+        [sys.executable, str(TOOL), *args],
         env=env, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
     )
     return proc.returncode, proc.stdout, proc.stderr
