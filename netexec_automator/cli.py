@@ -7,7 +7,8 @@ from pathlib import Path
 
 from .automator import NxcAutomator
 from .constants import (BOLD, CACHE_DEFAULT_PATH, CACHE_DEFAULT_TTL,
-                        CRACK_DEFAULT_TIMEOUT, DEFAULT_WORKERS, EXAM_SAFE_BLOCKLIST,
+                        CRACK_DEFAULT_TIMEOUT, DEAD_CACHE_DEFAULT_TTL,
+                        DEFAULT_WORKERS, EXAM_SAFE_BLOCKLIST,
                         MAX_RETRY, NETEXEC_TIMEOUT, RED, RESET, SUBPROCESS_TIMEOUT,
                         V_DEBUG, V_QUIET, YELLOW, LOW_POWER_PROFILE, DIM)
 
@@ -166,7 +167,14 @@ def _build_parser():
     g_scan.add_argument("--no-cache", action="store_true",
                         help="Bypass the SQLite nmap-result cache.")
     g_scan.add_argument("--cache-ttl", type=int, default=CACHE_DEFAULT_TTL,
-                        help=f"Cache TTL for nmap results in seconds (default: {CACHE_DEFAULT_TTL} = 24h).")
+                        help=f"Cache TTL for open-port results in seconds (default: {CACHE_DEFAULT_TTL} = 24h).")
+    g_scan.add_argument("--dead-ttl", type=int, default=DEAD_CACHE_DEFAULT_TTL,
+                        help=f"Shorter TTL for 'host dead / no open ports' results (default: "
+                             f"{DEAD_CACHE_DEFAULT_TTL} = 1h). Dead hosts are also re-probed for "
+                             "liveness every run, so a host that comes back online reappears at once.")
+    g_scan.add_argument("--rescan", action="store_true",
+                        help="Ignore cached scan results for the targets: re-check liveness and "
+                             "re-run nmap from scratch (the fresh result overwrites the cache).")
     g_scan.add_argument("--cache-path",
                         help=f"Custom SQLite cache path (default: {CACHE_DEFAULT_PATH}). Use this to "
                              "isolate concurrent / CI runs from each other.")
@@ -332,6 +340,7 @@ def _validate_args(args, parser):
         ("--delay",              args.delay,              0, None),
         ("--jitter",             args.jitter,             0, None),
         ("--cache-ttl",          args.cache_ttl,          0, None),
+        ("--dead-ttl",           args.dead_ttl,           0, None),
         ("--bloodhound-ttl",     args.bloodhound_ttl,     0, None),
         ("--rerun-after",        args.rerun_after,        0, None),
         ("--max-retry",          args.max_retry,          0, None),
@@ -498,8 +507,10 @@ def main():
             nmap_enabled=nmap_enabled,
             cache_enabled=not args.no_cache,
             cache_ttl=args.cache_ttl,
+            dead_ttl=args.dead_ttl,
             cache_path=args.cache_path,
             scan_only=args.scan_only,
+            rescan=args.rescan,
             verbosity=verbosity,
             enum_enabled=args.enum,
             modules=args.modules,

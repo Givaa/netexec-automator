@@ -19,6 +19,7 @@ from .bloodhound import BloodHoundRunner
 from .cache import HostCache
 from .constants import (ALL_PROTOCOLS, AUTH_RESPONSE_PATTERNS, BANNER_WIDTH,
                         BLUE, BOLD, CACHE_DEFAULT_PATH, CACHE_DEFAULT_TTL,
+                        DEAD_CACHE_DEFAULT_TTL,
                         CONNECTIVITY_TIMEOUT_PATTERNS, CRACK_DEFAULT_TIMEOUT,
                         CYAN, DEFAULT_WORKERS, DIM, GREEN, HASH_AUTH_PROTOCOLS,
                         HASH_DUMP_LINE_RE, HASH_LMNT_PATTERN, HASH_NT_PATTERN,
@@ -62,8 +63,10 @@ class NxcAutomator:
         nmap_enabled: bool = False,
         cache_enabled: bool = True,
         cache_ttl: int = CACHE_DEFAULT_TTL,
+        dead_ttl: int = DEAD_CACHE_DEFAULT_TTL,
         cache_path: str | None = None,
         scan_only: bool = False,
+        rescan: bool = False,
         verbosity: int = V_NORMAL,
         enum_enabled: bool = False,
         modules: str | None = None,
@@ -148,6 +151,7 @@ class NxcAutomator:
         self.verbosity = verbosity
         self.nmap_enabled = nmap_enabled
         self.scan_only = scan_only
+        self.rescan = rescan
         self.scanner = (
             NmapScanner(ports=self._all_known_ports(), log_cmd=self._log_command)
             if nmap_enabled else None
@@ -156,7 +160,10 @@ class NxcAutomator:
         # and is required by --skip-tried (the tried_creds table lives here).
         cache_useful = (nmap_enabled or bloodhound_enabled or skip_tried) and cache_enabled
         resolved_cache_path = Path(cache_path).expanduser() if cache_path else CACHE_DEFAULT_PATH
-        self.cache = HostCache(resolved_cache_path, ttl=cache_ttl) if cache_useful else None
+        self.cache = (
+            HostCache(resolved_cache_path, ttl=cache_ttl, dead_ttl=dead_ttl)
+            if cache_useful else None
+        )
 
         self.enum_enabled = enum_enabled
         self.modules = [m.strip() for m in modules.split(",") if m.strip()] if modules else []
@@ -1917,16 +1924,32 @@ class NxcAutomator:
 
         expandable = self._is_expandable_spec(target)
 
-        if self.cache and not expandable:
+        # --rescan ignores the cache read so a fresh nmap overwrites whatever
+        # is stored (including re-validating a host marked dead).
+        if self.cache and not expandable and not self.rescan:
             cached = self.cache.get_fresh(target)
             if cached is not None:
                 open_set = {p for p, st in cached.items() if st == "open"}
+                if open_set:
+                    self._vprint(
+                        V_VERBOSE,
+                        f"  {DIM}🗎 cache hit {target} → {len(open_set)} open port(s){RESET}",
+                    )
+                    return {target: open_set}
+                # Cached as dead / no open ports. Liveness is volatile, so
+                # re-probe (cheap TCP connect) before trusting it — a host that
+                # came back online shouldn't stay skipped until the sentinel
+                # expires. Respect --no-reachability-check by trusting the cache.
+                if not self.reachability_check or not self._is_host_reachable(target):
+                    self._vprint(V_VERBOSE, f"  {DIM}🗎 cache hit {target} → dead (still unreachable){RESET}")
+                    return {}
                 self._vprint(
                     V_VERBOSE,
-                    f"  {DIM}🗎 cache hit {target} → {len(open_set)} open port(s){RESET}",
+                    f"  {DIM}🗎 {target} was cached dead but answers now → rescanning{RESET}",
                 )
-                return {target: open_set} if open_set else {}
-            self._vprint(V_VERBOSE, f"  {DIM}🗎 cache miss {target} → running nmap{RESET}")
+                self.cache.invalidate(target)
+            else:
+                self._vprint(V_VERBOSE, f"  {DIM}🗎 cache miss {target} → running nmap{RESET}")
 
         scan_result = self.scanner.scan(target)
         self._vprint(

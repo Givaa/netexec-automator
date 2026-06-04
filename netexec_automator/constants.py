@@ -102,7 +102,12 @@ BANNER_WIDTH = 60
 # cmd-log / loot-dir / log-file paths from wrapping and trashing the layout.
 BANNER_PATH_BUDGET = 42
 
-CACHE_DEFAULT_TTL = 86400  # 24h
+CACHE_DEFAULT_TTL = 86400  # 24h — open-port sets are stable, cache them long.
+# Dead/no-open-ports results are *volatile* (a host can come back online any
+# minute), so they get a much shorter TTL. The liveness re-probe in
+# _discover_target catches a returning host instantly on standard ports; this
+# bounds how long a host that returned on a non-standard port stays skipped.
+DEAD_CACHE_DEFAULT_TTL = 3600  # 1h
 CACHE_DEFAULT_PATH = Path.home() / ".cache" / "netexec-automator" / "state.db"
 NMAP_TIMEOUT = 180
 BLOODHOUND_TIMEOUT = 600

@@ -55,9 +55,13 @@ class HostCache:
     CREATE INDEX IF NOT EXISTS idx_tried_attempted ON tried_creds(attempted_at);
     """
 
-    def __init__(self, path: Path, ttl: int):
+    def __init__(self, path: Path, ttl: int, dead_ttl: int | None = None):
         self.path = path
         self.ttl = ttl
+        # Negative results (host scanned, nothing open) expire faster than
+        # positive ones — liveness is volatile. Defaults to ttl when unset
+        # so existing callers keep their old single-TTL behaviour.
+        self.dead_ttl = ttl if dead_ttl is None else dead_ttl
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # 30s busy-timeout absorbs concurrent runs / slow disks without
         # the dreaded 'database is locked' crash.
@@ -79,24 +83,27 @@ class HostCache:
 
     def get_fresh(self, target: str) -> dict[int, str] | None:
         """Return cached port→state map if scanned within TTL, else None.
-        Empty dict means 'scanned and nothing open' (still a cache hit)."""
-        cutoff = int(time.time()) - self.ttl
-        latest = self._conn.execute(
-            "SELECT MAX(scanned_at) FROM host_ports WHERE target = ?", (target,)
-        ).fetchone()
-        if not latest or latest[0] is None or latest[0] < cutoff:
-            # Sentinel row (port=0) lets us record 'scanned but dead' hosts.
-            sentinel = self._conn.execute(
-                "SELECT scanned_at FROM host_ports WHERE target = ? AND port = 0", (target,)
-            ).fetchone()
-            if sentinel and sentinel[0] >= cutoff:
-                return {}
-            return None
+        Empty dict means 'scanned and nothing open' (still a cache hit).
+
+        Positive results (open ports) are honoured for `ttl`; the negative
+        'scanned but dead' sentinel only for the shorter `dead_ttl`, so a host
+        that comes back online is re-scanned much sooner than a stable host's
+        open-port set is re-discovered."""
+        now = int(time.time())
+        # Positive rows (port > 0): fresh within the long ttl.
         rows = self._conn.execute(
-            "SELECT port, state FROM host_ports WHERE target = ? AND port > 0",
+            "SELECT port, state, scanned_at FROM host_ports WHERE target = ? AND port > 0",
             (target,),
         ).fetchall()
-        return {port: state for port, state in rows}
+        if rows and max(r[2] for r in rows) >= now - self.ttl:
+            return {port: state for port, state, _ in rows}
+        # Sentinel row (port = 0): 'scanned but dead', fresh within dead_ttl.
+        sentinel = self._conn.execute(
+            "SELECT scanned_at FROM host_ports WHERE target = ? AND port = 0", (target,)
+        ).fetchone()
+        if sentinel and sentinel[0] >= now - self.dead_ttl:
+            return {}
+        return None
 
     def store(self, target: str, ports: dict[int, str]):
         now = int(time.time())
@@ -112,6 +119,13 @@ class HostCache:
                 "INSERT INTO host_ports (target, port, state, scanned_at) VALUES (?, 0, 'none', ?)",
                 (target, now),
             )
+        self._conn.commit()
+
+    def invalidate(self, target: str):
+        """Drop all cached port rows for a target so the next discovery re-scans
+        it from scratch. Used by --rescan and by the dead-host liveness re-probe
+        when a previously-dead host answers again."""
+        self._conn.execute("DELETE FROM host_ports WHERE target = ?", (target,))
         self._conn.commit()
 
     def record_dc(self, domain: str, dc_ip: str, source: str):
