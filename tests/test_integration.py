@@ -34,7 +34,15 @@ def env_with_mock(tmp_path):
 
 
 def run_tool(args, env, cwd, timeout=30):
-    """Run the CLI and return (rc, stdout, stderr)."""
+    """Run the CLI and return (rc, stdout, stderr).
+
+    The nmap pre-scan is on by default now, but these tests drive the nxc
+    spray/orchestration against a mock nxc — a real nmap against the fake
+    target finds nothing open and would skip the spray entirely. So default
+    to --no-nmap unless the test explicitly opts into scanning."""
+    args = list(args)
+    if not {"--nmap", "--no-nmap", "--scan-only"}.intersection(args):
+        args = ["--no-nmap", *args]
     proc = subprocess.run(
         # sys.executable, not bare "python3" (which may resolve to a <3.10
         # system Python that can't parse the codebase's `str | None` syntax).

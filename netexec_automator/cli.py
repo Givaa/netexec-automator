@@ -27,6 +27,13 @@ def _normalize_module(name: str) -> str:
     return name.strip().lower().replace("-", "_")
 
 
+def _nmap_enabled(args) -> bool:
+    """The nmap pre-scan is on by default now: --no-nmap opts out, while
+    --scan-only (and the deprecated --nmap no-op) keep it on. So it's enabled
+    unless the user explicitly passed --no-nmap without --scan-only."""
+    return bool(args.scan_only or not args.no_nmap)
+
+
 def _load_toml_config(path: str) -> dict:
     """Read a TOML config and return a flat dict of CLI-overridable defaults.
 
@@ -150,9 +157,12 @@ def _build_parser():
     # ----- Pre-scan -----
     g_scan = parser.add_argument_group("nmap pre-scan & cache")
     g_scan.add_argument("--nmap", action="store_true",
-                        help="Pre-scan target ports with nmap; only spray protocols whose ports are open.")
+                        help="(Deprecated — the nmap pre-scan is on by default now; this flag is a harmless no-op.)")
+    g_scan.add_argument("--no-nmap", action="store_true",
+                        help="Disable the nmap pre-scan and spray every protocol on every target "
+                             "(the old default). Use where nmap isn't available or wanted.")
     g_scan.add_argument("--scan-only", action="store_true",
-                        help="Run nmap discovery only — no nxc attempts. Implies --nmap.")
+                        help="Run nmap discovery only — no nxc attempts. Forces the pre-scan on.")
     g_scan.add_argument("--no-cache", action="store_true",
                         help="Bypass the SQLite nmap-result cache.")
     g_scan.add_argument("--cache-ttl", type=int, default=CACHE_DEFAULT_TTL,
@@ -466,7 +476,8 @@ def main():
     _validate_args(args, parser)
     if args.workers is None:
         args.workers = DEFAULT_WORKERS
-    nmap_enabled = args.nmap or args.scan_only
+    # nmap pre-scan is on by default now (learn open ports per host, cache them).
+    nmap_enabled = _nmap_enabled(args)
     if args.quiet:
         verbosity = V_QUIET
     else:

@@ -26,6 +26,21 @@ def run_tool(args, env=None, cwd=None):
     return proc.returncode, proc.stdout, proc.stderr
 
 
+# ---- nmap default-on policy ----------------------------------------------
+
+def test_nmap_pre_scan_on_by_default():
+    """The nmap pre-scan is on by default; --no-nmap opts out; --scan-only
+    (and the deprecated --nmap no-op) keep it on."""
+    from netexec_automator.cli import _build_parser, _nmap_enabled
+    p = _build_parser()
+    base = ["-t", "10.0.0.5", "-u", "u", "-p", "p"]
+    assert _nmap_enabled(p.parse_args(base)) is True                       # default ON
+    assert _nmap_enabled(p.parse_args(base + ["--no-nmap"])) is False      # opt out
+    assert _nmap_enabled(p.parse_args(base + ["--scan-only"])) is True     # forces on
+    assert _nmap_enabled(p.parse_args(base + ["--no-nmap", "--scan-only"])) is True  # scan-only wins
+    assert _nmap_enabled(p.parse_args(base + ["--nmap"])) is True          # legacy no-op, still on
+
+
 # ---- _validate_args: file existence --------------------------------------
 
 def test_combo_missing_file_errors_cleanly(tmp_path):
