@@ -224,6 +224,21 @@ def test_probe_smb_banner_skips_when_already_known(nxa):
     run_mock.assert_not_called()
 
 
+def test_bulk_probe_runs_when_nmap_off_empty_ports(nxa):
+    """Regression: with --nmap off the bulk sweep passes an empty ports set
+    per host. It must still probe (open_ports=None), otherwise host_names is
+    never populated and the live header loses its '(hostname)' on no-PTR nets."""
+    a = nxa.NxcAutomator(target="x", user="u", password="p")
+    seen = {}
+    def fake_probe(host, open_ports=None):
+        seen[host] = open_ports
+        a.host_names[host] = "DC01"
+    with mock.patch.object(a, "_probe_smb_banner", side_effect=fake_probe):
+        a._bulk_probe_smb_banners({"10.10.10.5": set()})  # nmap-off shape
+    assert "10.10.10.5" in seen, "empty-ports host was not probed (regression)"
+    assert seen["10.10.10.5"] is None, "empty set must become None so the probe runs"
+
+
 def test_resolved_hostname_prefers_ptr_over_smb_banner(nxa):
     a = nxa.NxcAutomator(target="x", user="u", password="p")
     a.host_names["10.10.10.5"] = "DC01"

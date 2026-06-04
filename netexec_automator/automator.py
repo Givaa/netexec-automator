@@ -1177,7 +1177,11 @@ class NxcAutomator:
             return
         with ThreadPoolExecutor(max_workers=min(20, len(candidates))) as pool:
             futures = {
-                pool.submit(self._probe_smb_banner, h, hosts_with_ports.get(h)): h
+                # `or None`: when --nmap is off the ports set is empty, and
+                # _probe_smb_banner treats a non-None empty set as "no SMB
+                # ports → skip". Passing None means "ports unknown, probe
+                # anyway" so the host name still gets resolved in the header.
+                pool.submit(self._probe_smb_banner, h, hosts_with_ports.get(h) or None): h
                 for h in candidates
             }
             for fut in as_completed(futures):
