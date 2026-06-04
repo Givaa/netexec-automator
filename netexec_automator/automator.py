@@ -19,7 +19,7 @@ from .bloodhound import BloodHoundRunner
 from .cache import HostCache
 from .constants import (ALL_PROTOCOLS, AUTH_RESPONSE_PATTERNS, BANNER_WIDTH,
                         BLUE, BOLD, CACHE_DEFAULT_PATH, CACHE_DEFAULT_TTL,
-                        DEAD_CACHE_DEFAULT_TTL,
+                        DEAD_CACHE_DEFAULT_TTL, RANGE_EXPAND_CAP,
                         CONNECTIVITY_TIMEOUT_PATTERNS, CRACK_DEFAULT_TIMEOUT,
                         CYAN, DEFAULT_WORKERS, DIM, GREEN, HASH_AUTH_PROTOCOLS,
                         HASH_DUMP_LINE_RE, HASH_LMNT_PATTERN, HASH_NT_PATTERN,
@@ -1951,6 +1951,13 @@ class NxcAutomator:
             else:
                 self._vprint(V_VERBOSE, f"  {DIM}🗎 cache miss {target} → running nmap{RESET}")
 
+        # Range cache reuse: expand a CIDR and only nmap the IPs we don't
+        # already know, reusing cached open-port sets / dead sentinels.
+        if self.cache and expandable and not self.rescan:
+            expanded = self._expand_cidr(target)
+            if expanded is not None:
+                return self._discover_range_cached(target, expanded)
+
         scan_result = self.scanner.scan(target)
         self._vprint(
             V_DEBUG,
@@ -1973,6 +1980,56 @@ class NxcAutomator:
             for host, ports in scan_result.items()
             if any(st == "open" for st in ports.values())
         }
+
+    @staticmethod
+    def _expand_cidr(spec: str, cap: int = RANGE_EXPAND_CAP) -> list[str] | None:
+        """Expand a CIDR spec into its host IPs so we can reuse per-IP cache
+        entries. Returns None — meaning 'scan as a single nmap invocation' — for
+        non-CIDR specs (nmap dash-ranges, hostnames), unparseable input, or
+        ranges larger than `cap` hosts (per-IP bookkeeping isn't worth it)."""
+        if "/" not in spec:
+            return None
+        import ipaddress
+        try:
+            net = ipaddress.ip_network(spec, strict=False)
+        except ValueError:
+            return None
+        if net.num_addresses > cap:
+            return None
+        hosts = [str(ip) for ip in net.hosts()]
+        return hosts or [str(net.network_address)]  # /32 (and /31) → the address(es)
+
+    def _discover_range_cached(self, spec: str, ips: list[str]) -> dict[str, set[int]]:
+        """Discover a CIDR range while reusing the cache: only nmap the IPs we
+        don't already know (cache miss / expired), reusing cached open-port sets
+        and skipping hosts with a still-fresh dead sentinel. Freshly-scanned
+        results — including dead ones — are stored per IP so the next run skips
+        them too."""
+        known: dict[str, set[int]] = {}
+        to_scan: list[str] = []
+        for ip in ips:
+            cached = self.cache.get_fresh(ip)
+            if cached is None:
+                to_scan.append(ip)
+                continue
+            open_set = {p for p, st in cached.items() if st == "open"}
+            if open_set:
+                known[ip] = open_set
+            # else: cached dead within dead_ttl → skip (re-nmapped after dead_ttl)
+        if to_scan:
+            scan_result = self.scanner.scan(to_scan)
+            for ip in to_scan:
+                ports = scan_result.get(ip, {})
+                self.cache.store(ip, ports)  # open ports, or a dead sentinel
+                open_set = {p for p, st in ports.items() if st == "open"}
+                if open_set:
+                    known[ip] = open_set
+        self._vprint(
+            V_VERBOSE,
+            f"  {DIM}🗎 range {spec}: {len(ips) - len(to_scan)} cached, "
+            f"{len(to_scan)} scanned → {len(known)} live{RESET}",
+        )
+        return known
 
     @staticmethod
     def _format_open_ports(open_ports: set[int]) -> str:

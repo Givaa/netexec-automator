@@ -23,13 +23,18 @@ class NmapScanner:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
 
-    def scan(self, target: str) -> dict[str, dict[int, str]]:
-        """Run nmap on a target (single host, hostname, or CIDR).
+    def scan(self, targets) -> dict[str, dict[int, str]]:
+        """Run nmap on one or more targets (single host, hostname, CIDR, or an
+        iterable of any of those — e.g. the subset of a range we haven't cached).
         Returns {ip_or_hostname: {port: state}} only for hosts with at least one open port."""
+        target_list = [targets] if isinstance(targets, str) else list(targets)
+        if not target_list:
+            return {}
         port_arg = ",".join(str(p) for p in self.ports)
-        cmd = ["nmap", "-Pn", "-n", "--open", "-p", port_arg, "-T4", "-oX", "-", target]
+        cmd = ["nmap", "-Pn", "-n", "--open", "-p", port_arg, "-T4", "-oX", "-", *target_list]
         if self.log_cmd:
-            self.log_cmd("nmap", cmd, target)
+            label = target_list[0] if len(target_list) == 1 else f"{len(target_list)} hosts"
+            self.log_cmd("nmap", cmd, label)
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
         except subprocess.TimeoutExpired:

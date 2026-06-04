@@ -110,6 +110,10 @@ CACHE_DEFAULT_TTL = 86400  # 24h — open-port sets are stable, cache them long.
 DEAD_CACHE_DEFAULT_TTL = 3600  # 1h
 CACHE_DEFAULT_PATH = Path.home() / ".cache" / "netexec-automator" / "state.db"
 NMAP_TIMEOUT = 180
+# Ranges with up to this many addresses (a /20) are expanded so we can reuse
+# per-IP cache entries and only nmap the unknown hosts. Larger ranges are
+# scanned as a single nmap invocation (expanding them per-IP isn't worth it).
+RANGE_EXPAND_CAP = 4096
 BLOODHOUND_TIMEOUT = 600
 CRACK_DEFAULT_TIMEOUT = 600  # 10 min per hash-type attack
 
