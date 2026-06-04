@@ -35,6 +35,12 @@ def _nmap_enabled(args) -> bool:
     return bool(args.scan_only or not args.no_nmap)
 
 
+def _skip_tried_enabled(args) -> bool:
+    """Incremental spray (remember prior attempts, skip them next run) is on by
+    default now; --retry-all (a.k.a. --no-skip-tried) forces a full re-spray."""
+    return not args.retry_all
+
+
 def _load_toml_config(path: str) -> dict:
     """Read a TOML config and return a flat dict of CLI-overridable defaults.
 
@@ -179,15 +185,18 @@ def _build_parser():
                         help=f"Custom SQLite cache path (default: {CACHE_DEFAULT_PATH}). Use this to "
                              "isolate concurrent / CI runs from each other.")
     g_scan.add_argument("--skip-tried", action="store_true",
-                        help="Persist every (target, protocol, scope, user, secret) attempt to the "
-                             "SQLite cache and skip it on subsequent runs. Lets you add new users/"
-                             "passwords to the wordlists and re-run only the new combinations. "
-                             "Successes (and (Pwn3d!) lines) are always skipped on re-runs; "
-                             "failures stay skipped unless --rerun-after fires.")
+                        help="(Deprecated — incremental spray is on by default now; this flag is a "
+                             "harmless no-op.)")
+    g_scan.add_argument("--retry-all", "--no-skip-tried", dest="retry_all", action="store_true",
+                        help="Re-spray every (target, protocol, scope, user, secret) combination "
+                             "even if it was already tried in a prior run. By default the tool "
+                             "remembers prior attempts (persisted to the SQLite cache) and only "
+                             "sprays new combinations; successes and (Pwn3d!) are always skipped on "
+                             "re-runs, failures stay skipped unless --rerun-after fires.")
     g_scan.add_argument("--rerun-after", type=int, default=0, metavar="SECONDS",
-                        help="With --skip-tried: re-attempt past *failures* older than this many "
-                             "seconds (default: 0 = never re-attempt failures). Successes are still "
-                             "always skipped.")
+                        help="Re-attempt past *failures* older than this many seconds (default: "
+                             "0 = never re-attempt failures). Successes are still always skipped. "
+                             "No effect with --retry-all.")
     g_scan.add_argument("--clear-tried-cache", action="store_true",
                         help="Wipe the tried_creds table from the cache and exit. Use this when "
                              "you want --skip-tried to start fresh.")
@@ -541,7 +550,7 @@ def main():
             resolve_enabled=not args.no_resolve,
             resolve_timeout=args.resolve_timeout,
             no_banner=args.no_banner,
-            skip_tried=args.skip_tried,
+            skip_tried=_skip_tried_enabled(args),
             rerun_after=args.rerun_after,
             reachability_check=not args.no_reachability_check,
         )

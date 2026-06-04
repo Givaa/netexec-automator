@@ -773,6 +773,40 @@ class NxcAutomator:
             parts.append("bloodhound")
         return " · ".join(parts) if parts else "—"
 
+    def _prior_findings_summary(self) -> str:
+        """Compact one-line summary of credentials found valid in PRIOR runs for
+        the current targets, read from the cache, for the startup menu. Secrets
+        are never shown (only the hash is stored) — just user@host + Pwn3d.
+        Returns '' when there's nothing to show or no cache."""
+        if not self.cache:
+            return ""
+        try:
+            valid = self.cache.list_valid()
+        except Exception:  # noqa: BLE001 — the banner must never crash a run
+            return ""
+        if not valid:
+            return ""
+        # Restrict to the current targets (raw specs + expanded CIDR hosts).
+        wanted: set[str] = set()
+        for t in self.targets:
+            wanted.add(t)
+            expanded = self._expand_cidr(t)
+            if expanded:
+                wanted.update(expanded)
+        rows = [r for r in valid if r[0] in wanted]
+        if not rows:
+            return ""
+        pwn = sum(1 for r in rows if r[5])
+        samples = []
+        for target, _proto, _la, user, _domain, pwn3d in rows[:2]:
+            tag = f"{user or '<empty>'}@{target}"
+            if pwn3d:
+                tag += " (Pwn3d!)"
+            samples.append(tag)
+        more = f" +{len(rows) - 2} more" if len(rows) > 2 else ""
+        head = f"{len(rows)} valid" + (f" · {pwn} Pwn3d" if pwn else "")
+        return f"{head} — {', '.join(samples)}{more}"
+
     # ---- banner rendering -------------------------------------------------
 
     # The decorative banner is exactly _BANNER_WIDTH columns wide. The
@@ -839,6 +873,10 @@ class NxcAutomator:
             rerun = f"rerun-after={self.rerun_after}s" if self.rerun_after else "no rerun"
             rows.append(("Incremental", f"skip-tried · {tried_n} prior entries · {rerun}",
                          None, None))
+
+        prior = self._prior_findings_summary()
+        if prior:
+            rows.append(("Prior loot", prior, None, None))
 
         # Header / footer bar at the same width as the decorative banner.
         bar = "─" * self._BANNER_WIDTH

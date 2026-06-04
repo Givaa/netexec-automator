@@ -43,6 +43,12 @@ def run_tool(args, env, cwd, timeout=30):
     args = list(args)
     if not {"--nmap", "--no-nmap", "--scan-only"}.intersection(args):
         args = ["--no-nmap", *args]
+    # Isolate the cache per test: incremental spray (skip-tried) is on by
+    # default now, so a shared cache would make a host "already tried" and
+    # skip the spray on the next run. A fresh cache under cwd keeps tests
+    # deterministic and keeps the real ~/.cache clean.
+    if "--cache-path" not in args:
+        args = [*args, "--cache-path", str(Path(cwd) / "nxa-cache.db")]
     proc = subprocess.run(
         # sys.executable, not bare "python3" (which may resolve to a <3.10
         # system Python that can't parse the codebase's `str | None` syntax).

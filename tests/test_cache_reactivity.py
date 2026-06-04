@@ -158,3 +158,35 @@ def test_discover_target_routes_cidr_through_range_cache(nxa, tmp_path):
         result = a._discover_target("10.0.0.0/30")
     rc.assert_called_once()
     assert result == {"10.0.0.1": {445}}
+
+
+# ---- Phase 4: prior-findings menu summary -------------------------------
+
+def test_prior_findings_summary_filters_to_targets(nxa, tmp_path):
+    """The menu summary lists prior valid creds for the current targets only,
+    flags Pwn3d, and never shows the secret."""
+    a = nxa.NxcAutomator(target="10.0.0.5", user="u", password="p",
+                         skip_tried=True, cache_path=str(tmp_path / "s.db"))
+    a.cache.record_attempt("10.0.0.5", "smb", False, "administrator", "h1", None, "ok", pwn3d=True)
+    a.cache.record_attempt("10.9.9.9", "smb", False, "bob", "h2", None, "ok")  # other host
+    s = a._prior_findings_summary()
+    assert "administrator@10.0.0.5" in s
+    assert "Pwn3d" in s
+    assert "10.9.9.9" not in s      # filtered out — not a current target
+    assert "h1" not in s            # secret never shown
+
+
+def test_prior_findings_summary_empty_when_none(nxa, tmp_path):
+    a = nxa.NxcAutomator(target="10.0.0.5", user="u", password="p",
+                         skip_tried=True, cache_path=str(tmp_path / "s.db"))
+    assert a._prior_findings_summary() == ""
+
+
+def test_prior_findings_summary_matches_cidr_targets(nxa, tmp_path):
+    """A prior finding on a host inside a CIDR target is surfaced (the summary
+    expands the range to match per-IP cache rows)."""
+    a = nxa.NxcAutomator(target="10.0.0.0/30", user="u", password="p",
+                         skip_tried=True, cache_path=str(tmp_path / "s.db"))
+    a.cache.record_attempt("10.0.0.1", "smb", False, "svc", "h9", None, "ok")
+    s = a._prior_findings_summary()
+    assert "svc@10.0.0.1" in s

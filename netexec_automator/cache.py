@@ -236,5 +236,18 @@ class HostCache:
         row = self._conn.execute("SELECT COUNT(*) FROM tried_creds").fetchone()
         return int(row[0]) if row else 0
 
+    def list_valid(self) -> list[tuple[str, str, bool, str, str | None, bool]]:
+        """Return prior *successful* credentials as
+        (target, protocol, local_auth, user, domain, pwn3d), Pwn3d first.
+        These are the rows where auth worked (result='ok') or granted admin
+        (pwn3d=1). Secrets are never returned — only the hash is stored — so
+        this is safe to surface in the UI. Valid creds are rare, so callers
+        filter to the current targets in Python rather than via SQL."""
+        rows = self._conn.execute(
+            "SELECT target, protocol, local_auth, user, domain, pwn3d FROM tried_creds "
+            "WHERE result = 'ok' OR pwn3d = 1 ORDER BY pwn3d DESC, target, user"
+        ).fetchall()
+        return [(t, p, bool(la), u, d, bool(pw)) for t, p, la, u, d, pw in rows]
+
     def close(self):
         self._conn.close()

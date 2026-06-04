@@ -41,6 +41,18 @@ def test_nmap_pre_scan_on_by_default():
     assert _nmap_enabled(p.parse_args(base + ["--nmap"])) is True          # legacy no-op, still on
 
 
+def test_skip_tried_on_by_default():
+    """Incremental spray (remember prior attempts) is on by default;
+    --retry-all / --no-skip-tried force a full re-spray."""
+    from netexec_automator.cli import _build_parser, _skip_tried_enabled
+    p = _build_parser()
+    base = ["-t", "10.0.0.5", "-u", "u", "-p", "p"]
+    assert _skip_tried_enabled(p.parse_args(base)) is True                      # default ON
+    assert _skip_tried_enabled(p.parse_args(base + ["--retry-all"])) is False   # force full re-spray
+    assert _skip_tried_enabled(p.parse_args(base + ["--no-skip-tried"])) is False  # alias
+    assert _skip_tried_enabled(p.parse_args(base + ["--skip-tried"])) is True   # legacy no-op
+
+
 # ---- _validate_args: file existence --------------------------------------
 
 def test_combo_missing_file_errors_cleanly(tmp_path):

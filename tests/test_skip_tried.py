@@ -61,6 +61,20 @@ def test_record_upserts_on_pk(cache):
     assert cache.was_tried("10.0.0.5", "smb", False, "admin", "abc") == "ok"
 
 
+def test_list_valid_returns_successes_pwn3d_first(cache):
+    """list_valid returns only ok/pwn3d rows (never failures), Pwn3d first,
+    and never leaks the secret hash."""
+    cache.record_attempt("10.0.0.5", "smb", False, "bob", "h1", None, "fail")          # excluded
+    cache.record_attempt("10.0.0.5", "smb", False, "alice", "h2", None, "ok")          # valid
+    cache.record_attempt("10.0.0.6", "smb", True, "admin", "h3", None, "ok", pwn3d=True)  # pwn3d
+    rows = cache.list_valid()
+    assert len(rows) == 2
+    assert rows[0] == ("10.0.0.6", "smb", True, "admin", None, True)   # Pwn3d first
+    assert ("10.0.0.5", "smb", False, "alice", None, False) in rows
+    # secret hashes never appear in the returned tuples
+    assert all(h not in str(r) for r in rows for h in ("h1", "h2", "h3"))
+
+
 def test_clear_tried_cache_reports_count(cache):
     for u in ("a", "b", "c"):
         cache.record_attempt("10.0.0.5", "smb", False, u, "x", None, "fail")
