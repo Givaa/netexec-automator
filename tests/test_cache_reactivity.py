@@ -44,6 +44,41 @@ def test_dead_ttl_defaults_to_ttl_when_unset(nxa, tmp_path):
     c.close()
 
 
+def test_cache_concurrent_read_write_no_error(nxa, tmp_path):
+    """Regression: the spray drives cache reads (was_tried/get_fresh/list_valid)
+    and writes (record_attempt) concurrently across worker threads on ONE shared
+    sqlite connection. Unlocked reads used to raise sqlite3.InterfaceError
+    mid-write and silently drop spray attempts. All DB access is serialized now."""
+    import threading
+    c = nxa.HostCache(tmp_path / "s.db", ttl=86400)
+    errors: list[Exception] = []
+
+    def writer():
+        for i in range(200):
+            try:
+                c.record_attempt("10.0.0.5", "smb", False, f"u{i}", f"h{i}", None, "fail")
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+    def reader():
+        for i in range(200):
+            try:
+                c.was_tried("10.0.0.5", "smb", False, f"u{i}", f"h{i}")
+                c.get_fresh("10.0.0.5")
+                c.list_valid()
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+    threads = [threading.Thread(target=writer) for _ in range(3)] + \
+              [threading.Thread(target=reader) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    c.close()
+    assert not errors, f"concurrent cache access raised: {errors[:3]}"
+
+
 # ---- _discover_target: dead-host liveness gate + --rescan ----------------
 
 def _nmap_automator(nxa, tmp_path, **kw):
@@ -101,7 +136,9 @@ def test_rescan_bypasses_cache_hit(nxa, tmp_path):
 # ---- Phase 3: per-IP cache reuse for ranges/CIDR -------------------------
 
 def test_expand_cidr_small_range(nxa):
-    assert nxa.NxcAutomator._expand_cidr("10.0.0.0/30") == ["10.0.0.1", "10.0.0.2"]
+    # All addresses, incl. network/broadcast — matches what raw nmap would scan.
+    assert nxa.NxcAutomator._expand_cidr("10.0.0.0/30") == \
+        ["10.0.0.0", "10.0.0.1", "10.0.0.2", "10.0.0.3"]
 
 
 def test_expand_cidr_slash32(nxa):
@@ -129,16 +166,43 @@ def test_scanner_scan_accepts_list_of_targets(nxa):
 
 
 def test_range_cache_only_scans_unknown_ips(nxa, tmp_path):
-    """A range run reuses cached open/dead IPs and only nmaps the unknowns."""
+    """A range run reuses cached open/dead IPs and only nmaps the unknowns
+    (the dead .2 is re-probed but stays dead, so it isn't re-scanned)."""
     a = _nmap_automator(nxa, tmp_path)
     a.cache.store("10.0.0.1", {445: "open"})  # known live
     a.cache.store("10.0.0.2", {})             # known dead (sentinel)
     # 10.0.0.3 not cached
-    with mock.patch.object(a.scanner, "scan", return_value={"10.0.0.3": {3389: "open"}}) as scan_mock:
+    with mock.patch.object(a, "_is_host_reachable", return_value=False), \
+         mock.patch.object(a.scanner, "scan", return_value={"10.0.0.3": {3389: "open"}}) as scan_mock:
         result = a._discover_range_cached("10.0.0.0/29", ["10.0.0.1", "10.0.0.2", "10.0.0.3"])
     scan_mock.assert_called_once_with(["10.0.0.3"])                 # only the unknown
-    assert result == {"10.0.0.1": {445}, "10.0.0.3": {3389}}        # dead .2 excluded
+    assert result == {"10.0.0.1": {445}, "10.0.0.3": {3389}}        # dead .2 stays excluded
     assert a.cache.get_fresh("10.0.0.3") == {3389: "open"}          # newly cached
+
+
+def test_range_dead_cached_but_reachable_is_rescanned(nxa, tmp_path):
+    """Reactivity parity with single hosts: a cached-dead IP in a range that
+    answers a liveness probe is invalidated and re-nmapped (not skipped)."""
+    a = _nmap_automator(nxa, tmp_path)
+    a.cache.store("10.0.0.1", {})  # cached dead, but it's back online now
+    with mock.patch.object(a, "_is_host_reachable", return_value=True), \
+         mock.patch.object(a.scanner, "scan", return_value={"10.0.0.1": {445: "open"}}) as scan_mock:
+        result = a._discover_range_cached("10.0.0.0/30", ["10.0.0.1", "10.0.0.2"])
+    # .1 was revived → included in the nmap set alongside the unknown .2
+    assert set(scan_mock.call_args[0][0]) == {"10.0.0.1", "10.0.0.2"}
+    assert result == {"10.0.0.1": {445}}
+
+
+def test_range_dead_cached_not_reprobed_when_reachability_off(nxa, tmp_path):
+    """--no-reachability-check: cached-dead range IPs are trusted, not probed."""
+    a = _nmap_automator(nxa, tmp_path, reachability_check=False)
+    a.cache.store("10.0.0.1", {})  # cached dead
+    with mock.patch.object(a, "_is_host_reachable") as probe, \
+         mock.patch.object(a.scanner, "scan", return_value={}) as scan_mock:
+        result = a._discover_range_cached("10.0.0.0/30", ["10.0.0.1", "10.0.0.2"])
+    probe.assert_not_called()
+    scan_mock.assert_called_once_with(["10.0.0.2"])  # only the unknown; dead .1 trusted
+    assert result == {}
 
 
 def test_range_cache_stores_dead_sentinel_for_scanned_empty(nxa, tmp_path):

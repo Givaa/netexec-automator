@@ -70,11 +70,12 @@ class HostCache:
         # SQLite itself serializes writes; we add a Python-level lock to keep
         # multi-statement sequences (e.g. clear_tried_cache) atomic.
         self._conn = sqlite3.connect(str(self.path), timeout=30, check_same_thread=False)
-        # WAL lets cache readers (host-spray workers checking get_fresh/was_tried)
-        # proceed without blocking the single writer, and vice-versa — the
-        # prerequisite for spraying hosts in parallel off a shared cache.
-        # NORMAL sync is durable enough for a regenerable cache and drops one
-        # fsync per commit. Both PRAGMAs are idempotent and persist in the file.
+        # WAL keeps *separate* connections (e.g. concurrent CLI runs, each with
+        # its own HostCache) from blocking each other, and NORMAL sync drops one
+        # fsync per commit on a regenerable cache. It does NOT make a single
+        # sqlite3 connection object thread-safe, though — and the spray workers
+        # share THIS one connection — so every method below serializes its DB
+        # access through self._lock. Both PRAGMAs are idempotent and persist.
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._lock = Lock()
@@ -90,69 +91,75 @@ class HostCache:
         that comes back online is re-scanned much sooner than a stable host's
         open-port set is re-discovered."""
         now = int(time.time())
-        # Positive rows (port > 0): fresh within the long ttl.
-        rows = self._conn.execute(
-            "SELECT port, state, scanned_at FROM host_ports WHERE target = ? AND port > 0",
-            (target,),
-        ).fetchall()
-        if rows and max(r[2] for r in rows) >= now - self.ttl:
-            return {port: state for port, state, _ in rows}
-        # Sentinel row (port = 0): 'scanned but dead', fresh within dead_ttl.
-        sentinel = self._conn.execute(
-            "SELECT scanned_at FROM host_ports WHERE target = ? AND port = 0", (target,)
-        ).fetchone()
-        if sentinel and sentinel[0] >= now - self.dead_ttl:
-            return {}
-        return None
+        with self._lock:
+            # Positive rows (port > 0): fresh within the long ttl.
+            rows = self._conn.execute(
+                "SELECT port, state, scanned_at FROM host_ports WHERE target = ? AND port > 0",
+                (target,),
+            ).fetchall()
+            if rows and max(r[2] for r in rows) >= now - self.ttl:
+                return {port: state for port, state, _ in rows}
+            # Sentinel row (port = 0): 'scanned but dead', fresh within dead_ttl.
+            sentinel = self._conn.execute(
+                "SELECT scanned_at FROM host_ports WHERE target = ? AND port = 0", (target,)
+            ).fetchone()
+            if sentinel and sentinel[0] >= now - self.dead_ttl:
+                return {}
+            return None
 
     def store(self, target: str, ports: dict[int, str]):
         now = int(time.time())
-        self._conn.execute("DELETE FROM host_ports WHERE target = ?", (target,))
-        if ports:
-            self._conn.executemany(
-                "INSERT INTO host_ports (target, port, state, scanned_at) VALUES (?, ?, ?, ?)",
-                [(target, port, state, now) for port, state in ports.items()],
-            )
-        else:
-            # Sentinel: record that we scanned this target and found nothing.
-            self._conn.execute(
-                "INSERT INTO host_ports (target, port, state, scanned_at) VALUES (?, 0, 'none', ?)",
-                (target, now),
-            )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("DELETE FROM host_ports WHERE target = ?", (target,))
+            if ports:
+                self._conn.executemany(
+                    "INSERT INTO host_ports (target, port, state, scanned_at) VALUES (?, ?, ?, ?)",
+                    [(target, port, state, now) for port, state in ports.items()],
+                )
+            else:
+                # Sentinel: record that we scanned this target and found nothing.
+                self._conn.execute(
+                    "INSERT INTO host_ports (target, port, state, scanned_at) VALUES (?, 0, 'none', ?)",
+                    (target, now),
+                )
+            self._conn.commit()
 
     def invalidate(self, target: str):
         """Drop all cached port rows for a target so the next discovery re-scans
         it from scratch. Used by --rescan and by the dead-host liveness re-probe
         when a previously-dead host answers again."""
-        self._conn.execute("DELETE FROM host_ports WHERE target = ?", (target,))
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("DELETE FROM host_ports WHERE target = ?", (target,))
+            self._conn.commit()
 
     def record_dc(self, domain: str, dc_ip: str, source: str):
         """Upsert a domain controller discovery (idempotent on PK)."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO domain_controllers "
-            "(domain, dc_ip, source, discovered_at) VALUES (?, ?, ?, ?)",
-            (domain.lower(), dc_ip, source, int(time.time())),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO domain_controllers "
+                "(domain, dc_ip, source, discovered_at) VALUES (?, ?, ?, ?)",
+                (domain.lower(), dc_ip, source, int(time.time())),
+            )
+            self._conn.commit()
 
     def get_dcs(self, domain: str) -> list[tuple[str, str]]:
         """Return [(dc_ip, source)] for a domain, most recent first."""
-        rows = self._conn.execute(
-            "SELECT dc_ip, source FROM domain_controllers WHERE domain = ? "
-            "ORDER BY discovered_at DESC",
-            (domain.lower(),),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT dc_ip, source FROM domain_controllers WHERE domain = ? "
+                "ORDER BY discovered_at DESC",
+                (domain.lower(),),
+            ).fetchall()
         return list(rows)
 
     def recent_bloodhound(self, domain: str, ttl: int) -> dict | None:
         cutoff = int(time.time()) - ttl
-        row = self._conn.execute(
-            "SELECT domain, dc_ip, auth_user, output_path, ran_at, success "
-            "FROM bloodhound_runs WHERE domain = ? AND ran_at >= ? AND success = 1",
-            (domain.lower(), cutoff),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT domain, dc_ip, auth_user, output_path, ran_at, success "
+                "FROM bloodhound_runs WHERE domain = ? AND ran_at >= ? AND success = 1",
+                (domain.lower(), cutoff),
+            ).fetchone()
         if not row:
             return None
         return {
@@ -161,13 +168,14 @@ class HostCache:
         }
 
     def record_bloodhound(self, domain: str, dc_ip: str, auth_user: str, output_path: str, success: bool):
-        self._conn.execute(
-            "INSERT OR REPLACE INTO bloodhound_runs "
-            "(domain, dc_ip, auth_user, output_path, ran_at, success) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (domain.lower(), dc_ip, auth_user, output_path, int(time.time()), 1 if success else 0),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO bloodhound_runs "
+                "(domain, dc_ip, auth_user, output_path, ran_at, success) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (domain.lower(), dc_ip, auth_user, output_path, int(time.time()), 1 if success else 0),
+            )
+            self._conn.commit()
 
     # ---- tried_creds ----------------------------------------------------
 
@@ -187,11 +195,12 @@ class HostCache:
         behaviour: anything tried before stays skipped). rerun_after = N
         means 'rerun if older than N seconds AND the previous result wasn't ok'.
         Successes (ok / pwn3d) are never re-attempted by default."""
-        row = self._conn.execute(
-            "SELECT result, pwn3d, attempted_at FROM tried_creds "
-            "WHERE target = ? AND protocol = ? AND local_auth = ? AND user = ? AND secret_hash = ?",
-            (target, protocol, 1 if local_auth else 0, user, secret_hash),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT result, pwn3d, attempted_at FROM tried_creds "
+                "WHERE target = ? AND protocol = ? AND local_auth = ? AND user = ? AND secret_hash = ?",
+                (target, protocol, 1 if local_auth else 0, user, secret_hash),
+            ).fetchone()
         if not row:
             return None
         result, pwn3d, attempted_at = row
@@ -227,13 +236,15 @@ class HostCache:
 
     def clear_tried_cache(self) -> int:
         """Wipe the tried_creds table. Returns the number of rows deleted."""
-        count = self._conn.execute("SELECT COUNT(*) FROM tried_creds").fetchone()[0]
-        self._conn.execute("DELETE FROM tried_creds")
-        self._conn.commit()
+        with self._lock:
+            count = self._conn.execute("SELECT COUNT(*) FROM tried_creds").fetchone()[0]
+            self._conn.execute("DELETE FROM tried_creds")
+            self._conn.commit()
         return int(count)
 
     def count_tried(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) FROM tried_creds").fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM tried_creds").fetchone()
         return int(row[0]) if row else 0
 
     def list_valid(self) -> list[tuple[str, str, bool, str, str | None, bool]]:
@@ -243,10 +254,11 @@ class HostCache:
         (pwn3d=1). Secrets are never returned — only the hash is stored — so
         this is safe to surface in the UI. Valid creds are rare, so callers
         filter to the current targets in Python rather than via SQL."""
-        rows = self._conn.execute(
-            "SELECT target, protocol, local_auth, user, domain, pwn3d FROM tried_creds "
-            "WHERE result = 'ok' OR pwn3d = 1 ORDER BY pwn3d DESC, target, user"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT target, protocol, local_auth, user, domain, pwn3d FROM tried_creds "
+                "WHERE result = 'ok' OR pwn3d = 1 ORDER BY pwn3d DESC, target, user"
+            ).fetchall()
         return [(t, p, bool(la), u, d, bool(pw)) for t, p, la, u, d, pw in rows]
 
     def close(self):

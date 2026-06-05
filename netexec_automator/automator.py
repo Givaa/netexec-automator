@@ -2034,17 +2034,25 @@ class NxcAutomator:
             return None
         if net.num_addresses > cap:
             return None
-        hosts = [str(ip) for ip in net.hosts()]
-        return hosts or [str(net.network_address)]  # /32 (and /31) → the address(es)
+        # Iterate the whole block (network + broadcast included), NOT .hosts():
+        # nmap given the raw CIDR scans every address, so expanding to a subset
+        # would silently miss a host configured on the .0 / .255 of a routed net.
+        return [str(ip) for ip in net]
 
     def _discover_range_cached(self, spec: str, ips: list[str]) -> dict[str, set[int]]:
         """Discover a CIDR range while reusing the cache: only nmap the IPs we
         don't already know (cache miss / expired), reusing cached open-port sets
         and skipping hosts with a still-fresh dead sentinel. Freshly-scanned
         results — including dead ones — are stored per IP so the next run skips
-        them too."""
+        them too.
+
+        Dead-cached IPs are re-probed for liveness (concurrently) just like the
+        single-host path, so a host inside the range that comes back online is
+        re-nmapped at once instead of waiting out dead_ttl — honouring
+        --no-reachability-check, which trusts the sentinel and skips the probe."""
         known: dict[str, set[int]] = {}
         to_scan: list[str] = []
+        dead_cached: list[str] = []
         for ip in ips:
             cached = self.cache.get_fresh(ip)
             if cached is None:
@@ -2053,7 +2061,15 @@ class NxcAutomator:
             open_set = {p for p, st in cached.items() if st == "open"}
             if open_set:
                 known[ip] = open_set
-            # else: cached dead within dead_ttl → skip (re-nmapped after dead_ttl)
+            else:
+                dead_cached.append(ip)  # fresh dead sentinel — re-probe below
+        # Reactivity: any cached-dead IP that answers a liveness probe now is
+        # invalidated and folded back into the nmap set.
+        if dead_cached and self.reachability_check:
+            revived = self._filter_reachable(dead_cached)
+            for ip in revived:
+                self.cache.invalidate(ip)
+            to_scan.extend(revived)
         if to_scan:
             scan_result = self.scanner.scan(to_scan)
             for ip in to_scan:
@@ -2068,6 +2084,22 @@ class NxcAutomator:
             f"{len(to_scan)} scanned → {len(known)} live{RESET}",
         )
         return known
+
+    def _filter_reachable(self, ips: list[str]) -> list[str]:
+        """Return the subset of `ips` that answer a liveness probe, checked
+        concurrently. Used to re-validate cached-dead IPs in a range without the
+        per-host serial cost. _is_host_reachable touches no shared state, so it
+        is safe to fan out; cache writes happen afterwards, under the lock."""
+        reachable: list[str] = []
+        with ThreadPoolExecutor(max_workers=min(32, len(ips))) as pool:
+            futures = {pool.submit(self._is_host_reachable, ip): ip for ip in ips}
+            for fut in as_completed(futures):
+                try:
+                    if fut.result():
+                        reachable.append(futures[fut])
+                except Exception:  # noqa: BLE001 — a probe error just means "still dead"
+                    pass
+        return reachable
 
     @staticmethod
     def _format_open_ports(open_ports: set[int]) -> str:
