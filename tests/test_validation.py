@@ -398,3 +398,14 @@ def test_deprecated_flags_are_accepted_as_noops(tmp_path):
     )
     assert rc == 0
     assert "error" not in err.lower()
+
+
+# ---- nmap-style error helper --------------------------------------------
+
+def test_unknown_flag_points_to_help(tmp_path):
+    """A bogus/unknown flag must fail with exit 2 and point at --help
+    (nmap-style), not dump the whole usage block."""
+    rc, out, err = run_tool(["--definitely-not-a-real-flag"], cwd=tmp_path)
+    assert rc == 2
+    assert "error" in err.lower()
+    assert "--help" in err

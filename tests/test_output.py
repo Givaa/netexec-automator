@@ -290,3 +290,19 @@ def test_print_loot_on_record_empty_says_nothing_on_record(nxa, capsys):
     nxa.NxcAutomator.print_loot_on_record([])
     out = strip_ansi(capsys.readouterr().out)
     assert "no valid credentials on record" in out.lower()
+
+
+# ---- --null-session is protocol-aware -----------------------------------
+
+def test_null_session_is_protocol_aware(nxa):
+    """--null-session tries null/Guest/anonymous:'' on every protocol, plus
+    FTP's classic anonymous:anonymous and ftp:ftp ONLY on FTP."""
+    a = nxa.NxcAutomator(target="x", null_session=True, no_banner=True)
+    ftp = [c.display for c in a.credentials if nxa.NxcAutomator._credential_supported(c, "ftp")]
+    smb = [c.display for c in a.credentials if nxa.NxcAutomator._credential_supported(c, "smb")]
+    # FTP gets the full set including the FTP-specific combos
+    assert "ftp:ftp" in ftp and "anonymous:anonymous" in ftp
+    assert "<empty>:<empty>" in ftp
+    # Other protocols keep the universal null/Guest/anonymous but NOT ftp noise
+    assert "<empty>:<empty>" in smb and "Guest:<empty>" in smb
+    assert "ftp:ftp" not in smb and "anonymous:anonymous" not in smb

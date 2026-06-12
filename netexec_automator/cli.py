@@ -113,8 +113,22 @@ examples:
 """
 
 
+class _HelpfulParser(argparse.ArgumentParser):
+    """nmap-style errors: on a bad or unknown argument, print a single clear
+    line and point at --help, instead of dumping the whole (large) usage block.
+    Exit code stays 2 so scripts and tests still detect the failure."""
+
+    def error(self, message):
+        prog = self.prog
+        sys.stderr.write(f"{RED}{prog}: error:{RESET} {message}\n")
+        sys.stderr.write(
+            f"{DIM}→ run '{prog} --help' for usage and the full list of options.{RESET}\n"
+        )
+        sys.exit(2)
+
+
 def _build_parser():
-    parser = argparse.ArgumentParser(
+    parser = _HelpfulParser(
         description="NetExec Automator — spray 'em all. Multi-protocol AD pwnage in one command "
                     "(nmap pre-scan, hash/Kerberos auth, auto-enum, secretsdump, hashcat, BloodHound).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -160,7 +174,9 @@ def _build_parser():
     g_auth.add_argument("--combo",
                         help="Combo file (user:secret per line). Auto-detects password vs NT/LM:NT hash.")
     g_auth.add_argument("--null-session", action="store_true",
-                        help="Also probe null session + Guest:'' + anonymous:'' as cheap quick-wins.")
+                        help="Also probe anonymous/null logins as cheap quick-wins: null session, "
+                             "Guest:'' and anonymous:'' on every protocol, plus FTP's classic "
+                             "anonymous:anonymous and ftp:ftp (tried only on FTP).")
     g_auth.add_argument("-m", "--mode", type=parse_mode, default="combination",
                         metavar="{combination,linear}",
                         help="Credential pairing: combination (cartesian, default) or linear (1-to-1).")

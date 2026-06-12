@@ -30,6 +30,7 @@ class Credential:
     password: str | None = None
     nthash: str | None = None
     lmhash: str | None = None  # optional, paired with nthash as LM:NT
+    protocols: frozenset[str] | None = None  # None = try on all; else only these (e.g. FTP-only anon logins)
 
     @property
     def is_hash(self) -> bool:

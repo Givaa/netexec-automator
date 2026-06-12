@@ -9,6 +9,17 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 
 ## [Unreleased]
 
+### Changed — nmap-style errors + protocol-aware `--null-session`
+- **Friendlier argument errors.** A bad or unknown flag now prints a single
+  clear line and points at `--help` (nmap-style) instead of dumping the whole
+  usage block. Exit code stays 2.
+- **`--null-session` is now protocol-aware.** It still tries null session,
+  `Guest:''` and `anonymous:''` on every protocol, and now also tries FTP's
+  classic `anonymous:anonymous` and `ftp:ftp` — but only on FTP, so other
+  protocols aren't sprayed with FTP noise. Anonymous logins (incl. the new
+  `ftp` user) are correctly excluded from the lockout-risk count and labelled
+  "anon" in the banner (also fixes a latent `Guest` case-mismatch there).
+
 ### Added — loot recall (`--show`) and engagement reset (`--reset`)
 - **`--show`**: print the valid credentials already on record (read from the
   SQLite cache), grouped by domain, then exit. Shows `user@host [proto/scope]`

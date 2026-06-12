@@ -91,6 +91,24 @@ NULL_SESSION_CREDS: list[tuple[str, str]] = [
     ("anonymous", ""),
 ]
 
+# Protocol-specific anonymous logins added on top of NULL_SESSION_CREDS when
+# --null-session is on. The universal set above (null / Guest:'' / anonymous:'')
+# already covers SMB / LDAP / WinRM / RDP / MSSQL / VNC null sessions; FTP has
+# its own classic anonymous combos that the empty-password ones miss. Each is
+# tried ONLY on its protocol (see _credential_supported), so SMB etc. don't get
+# sprayed with ftp:ftp noise.
+PROTOCOL_ANON_CREDS: dict[str, list[tuple[str, str]]] = {
+    "ftp": [("anonymous", "anonymous"), ("ftp", "ftp")],
+}
+
+# Every username used by a --null-session anonymous attempt (universal +
+# per-protocol), lowercased. Used to (a) keep anon logins out of the
+# lockout-risk count and (b) label them as "anon" in the banner summary.
+ANON_USERNAMES: frozenset[str] = frozenset(
+    {u.lower() for u, _ in NULL_SESSION_CREDS}
+    | {u.lower() for combos in PROTOCOL_ANON_CREDS.values() for u, _ in combos}
+)
+
 # ---- Defaults / timeouts -----------------------------------------------
 
 DEFAULT_WORKERS = len(ALL_PROTOCOLS) + len(LOCAL_AUTH_PROTOCOLS)

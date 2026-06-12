@@ -17,7 +17,7 @@ from threading import Lock
 
 from .bloodhound import BloodHoundRunner
 from .cache import HostCache
-from .constants import (ALL_PROTOCOLS, AUTH_RESPONSE_PATTERNS, BANNER_WIDTH,
+from .constants import (ALL_PROTOCOLS, ANON_USERNAMES, AUTH_RESPONSE_PATTERNS, BANNER_WIDTH,
                         BLUE, BOLD, CACHE_DEFAULT_PATH, CACHE_DEFAULT_TTL,
                         DEAD_CACHE_DEFAULT_TTL, RANGE_EXPAND_CAP,
                         CONNECTIVITY_TIMEOUT_PATTERNS, CRACK_DEFAULT_TIMEOUT,
@@ -30,7 +30,8 @@ from .constants import (ALL_PROTOCOLS, AUTH_RESPONSE_PATTERNS, BANNER_WIDTH,
                         KRB_AS_REP_USER_RE, KRB_TGS_REP_USER_RE,
                         LDAP_ENUM_ACTIONS, LOCAL_AUTH_PROTOCOLS,
                         LOCKOUT_DURATION_RE, LOCKOUT_THRESHOLD_RE, MAX_RETRY,
-                        NETEXEC_TIMEOUT, NULL_SESSION_CREDS, PROTOCOL_PORTS,
+                        NETEXEC_TIMEOUT, NULL_SESSION_CREDS, PROTOCOL_ANON_CREDS,
+                        PROTOCOL_PORTS,
                         RED, RESET, ROCKYOU_DOWNLOAD_URL, SMB_DOMAIN_RE,
                         SMB_ENUM_ACTIONS, SMB_NAME_RE, SMB_SECRETS_ACTIONS,
                         SUBPROCESS_TIMEOUT, V_DEBUG, V_NORMAL, V_QUIET,
@@ -362,7 +363,16 @@ class NxcAutomator:
 
         # Null-session and Guest/anonymous fast-checks go first (cheapest signals).
         if self.null_session:
+            # Universal null/Guest/anonymous (tried on every protocol)...
             creds.extend(Credential(user=u, password=p) for u, p in NULL_SESSION_CREDS)
+            # ...plus protocol-specific anonymous logins (e.g. FTP anonymous:anonymous,
+            # ftp:ftp) that the empty-password set misses — each restricted to its
+            # own protocol so other protocols don't get sprayed with them.
+            for proto, combos in PROTOCOL_ANON_CREDS.items():
+                creds.extend(
+                    Credential(user=u, password=p, protocols=frozenset({proto}))
+                    for u, p in combos
+                )
 
         if self.combo_arg:
             if self.password_arg or self.hash_arg or self.user_arg:
@@ -453,8 +463,12 @@ class NxcAutomator:
 
     @staticmethod
     def _credential_supported(credential: Credential, protocol: str) -> bool:
-        """Skip hash creds on protocols nxc doesn't expose -H for (ssh/ftp/vnc/nfs)."""
+        """Skip hash creds on protocols nxc doesn't expose -H for (ssh/ftp/vnc/nfs),
+        and skip protocol-restricted creds (e.g. FTP-only anonymous logins) on
+        every other protocol."""
         if credential.is_hash and protocol not in HASH_AUTH_PROTOCOLS:
+            return False
+        if credential.protocols is not None and protocol not in credential.protocols:
             return False
         return True
 
@@ -731,13 +745,12 @@ class NxcAutomator:
 
     def _credential_summary(self) -> str:
         """Compact one-liner describing credential composition for the banner."""
-        null_users = {u for u, _ in NULL_SESSION_CREDS}
         n_pwd = sum(
             1 for c in self.credentials
-            if not c.is_hash and c.user not in null_users
+            if not c.is_hash and c.user.lower() not in ANON_USERNAMES
         )
         n_hash = sum(1 for c in self.credentials if c.is_hash)
-        n_quick = sum(1 for c in self.credentials if c.user in null_users and not c.is_hash)
+        n_quick = sum(1 for c in self.credentials if c.user.lower() in ANON_USERNAMES and not c.is_hash)
         parts: list[str] = []
         if n_pwd:
             parts.append(f"{n_pwd} pwd")
@@ -1850,7 +1863,7 @@ class NxcAutomator:
         duration = duration_match.group(1).strip() if duration_match else "?"
         per_user_attempts = sum(
             1 for c in self.credentials
-            if c.user and c.user.lower() not in {u for u, _ in NULL_SESSION_CREDS}
+            if c.user and c.user.lower() not in ANON_USERNAMES
         )
         self.lockout_warnings.append({"host": host, "threshold": threshold, "duration": duration})
         if per_user_attempts > threshold:
