@@ -9,6 +9,31 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 
 ## [Unreleased]
 
+### Added — loot recall (`--show`) and engagement reset (`--reset`)
+- **`--show`**: print the valid credentials already on record (read from the
+  SQLite cache), grouped by domain, then exit. Shows `user@host [proto/scope]`
+  and `(Pwn3d!)`; secrets are never printed (only the SHA1 hash is stored).
+- **`--reset`**: wipe **all** cached state — port scans, tried creds + loot, DC
+  discoveries and BloodHound runs — for a clean start on a new domain/context,
+  then exit. Supersedes `--clear-tried-cache` (now a hidden deprecated alias
+  that still wipes only the tried-creds table).
+- **End-of-run loot reminder**: when the cache holds valid creds from *prior*
+  runs (beyond what this run found), the FINAL REPORT is followed by a
+  by-domain "LOOT ON RECORD" ledger. Skipped when this run is the only source,
+  so there's no redundancy with the per-run report.
+
+### Changed — menu & flag cleanup
+- The startup menu's separate "Incremental" and "Prior loot" rows are merged
+  into one compact **Memory** line (`N tried · M valid · …`), shown only when
+  the cache actually holds something.
+- Deprecated no-op flags (`--nmap`, `--skip-tried`) and the superseded
+  `--clear-tried-cache` are hidden from `--help` (they still work). The
+  `--help` examples no longer push the deprecated `--nmap` and now show
+  `--show` / `--reset` / `--retry-all` / `--no-nmap`.
+- Clarified that every spray tries **both** domain auth and local auth
+  (`--local-auth`) for SMB/WMI/WinRM/RDP/MSSQL — already the behaviour, now
+  covered by a test and reflected in the menu's `Protocols N (+local auth)`.
+
 ### Changed — stateful, incremental discovery & spray
 The tool now remembers what it learned across runs and only redoes work on
 purpose. Four behaviour changes, each with an explicit opt-out:

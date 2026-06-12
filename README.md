@@ -494,7 +494,6 @@ Most-used flags at a glance:
 | `--null-session` | off | Prepend null/Guest/anonymous attempts |
 | nmap pre-scan | **on** | Port pre-scan is on by default; only protocols with open ports are sprayed, and open ports are cached per host and reused |
 | `--no-nmap` | off | Disable the pre-scan and spray every protocol on every target (the old default) |
-| `--nmap` | — | Deprecated no-op (pre-scan is on by default now) |
 | `--scan-only` | off | Pre-scan only, no auth attempts (forces the pre-scan on) |
 | `--rescan` | off | Ignore cached scan results for the targets: re-check liveness and re-run nmap from scratch |
 | `--no-cache` | off | Bypass SQLite cache |
@@ -503,9 +502,9 @@ Most-used flags at a glance:
 | `--cache-path` | `~/.cache/...` | Custom SQLite cache path (isolate parallel/CI runs) |
 | incremental spray | **on** | Prior (host, protocol, scope, user, secret) attempts are remembered and skipped; only new combinations are sprayed. Successes/(Pwn3d!) always skipped on re-runs |
 | `--retry-all` | off | Re-spray every combination even if already tried (alias `--no-skip-tried`) |
-| `--skip-tried` | — | Deprecated no-op (incremental spray is on by default now) |
 | `--rerun-after` | `0` | Re-attempt past *failures* older than this many seconds (0 = never) |
-| `--clear-tried-cache` | off | Wipe the tried-credentials cache and exit |
+| `--show` | off | Print the valid credentials already on record (grouped by domain), then exit — never prints secrets |
+| `--reset` | off | Wipe **all** cached state (port scans, tried creds + loot, DC & BloodHound) for a new engagement, then exit |
 | `--no-reachability-check` | off | Skip the stdlib TCP-connect probe (used to gate dead-host re-scan and the no-nmap path) |
 | `--enum` | off | SMB enum probes into `loot/` |
 | `--modules` | — | Comma-separated nxc `-M` modules |
