@@ -9,6 +9,24 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 
 ## [Unreleased]
 
+### Added — `--combo-spray` + host-centric recap
+- **`--combo-spray`**: with `--combo`, treat the file's users and secrets as
+  pools and spray every secret against every user (cartesian), like
+  `-u users -p passwords`, instead of only the 1:1 `user:secret` pairs. Errors
+  out if used without `--combo`.
+- **Host-centric FINAL REPORT.** The recap now leads with the hosts you fully
+  own — "OWNED — full admin on N host(s)", each as "💀 host — you have admin
+  here" with its admin creds — then lists hosts where creds hit but you're not
+  admin yet ("VALID CREDS — N host(s), no admin yet"), grouped by host.
+
+### Fixed — colons in cracked passwords
+- The hashcat/john potfile parser split on the **last** `:`, so a cracked NT
+  password containing a colon (e.g. `Sum:mer:25`) was truncated and then
+  dropped by the hash-type filter. It now splits on the first colon after the
+  32-hex NT hash (Kerberos hashes, which embed colons, still use the last
+  colon). Combo-file parsing already split on the first colon — verified and
+  locked with a test (passwords with colons are kept whole).
+
 ### Changed — nmap-style errors + protocol-aware `--null-session`
 - **Friendlier argument errors.** A bad or unknown flag now prints a single
   clear line and points at `--help` (nmap-style) instead of dumping the whole

@@ -82,7 +82,9 @@ def test_verbose_mode_shows_full_block(nxa, capsys):
 
 # ---- FINAL REPORT ---------------------------------------------------------
 
-def test_final_report_lists_pwn3d_separately(nxa, capsys):
+def test_final_report_is_host_centric_owned_first(nxa, capsys):
+    """Recap leads with hosts you fully own (admin/Pwn3d) — 'this host is
+    yours' — then lists hosts with creds but no admin, owned ones first."""
     a = nxa.NxcAutomator(target="x", user="u", password="p", no_banner=True)
     cred = a.credentials[0]
     a.valid_creds = [
@@ -93,9 +95,12 @@ def test_final_report_lists_pwn3d_separately(nxa, capsys):
     ]
     a._print_final_report()
     out = strip_ansi(capsys.readouterr().out)
-    assert "ADMIN PWN3D (1)" in out
-    assert "VALID CREDENTIALS (1)" in out
+    assert "OWNED — full admin on 1 host(s)" in out
+    assert "you have admin here" in out
+    assert "VALID CREDS — 1 host(s)" in out
     assert "10.0.0.5" in out and "10.0.0.7" in out
+    # Owned host is listed before the valid-only host.
+    assert out.index("10.0.0.5") < out.index("10.0.0.7")
 
 
 def test_final_report_lists_harvested_and_cracked(nxa, capsys):
@@ -306,3 +311,33 @@ def test_null_session_is_protocol_aware(nxa):
     # Other protocols keep the universal null/Guest/anonymous but NOT ftp noise
     assert "<empty>:<empty>" in smb and "Guest:<empty>" in smb
     assert "ftp:ftp" not in smb and "anonymous:anonymous" not in smb
+
+
+# ---- combo parsing & --combo-spray --------------------------------------
+
+def test_combo_password_with_colons_kept_whole(nxa, tmp_path):
+    """Combo lines split on the FIRST ':' — a password with more colons stays
+    intact (no user has ':' in their name)."""
+    combo = tmp_path / "combo.txt"
+    combo.write_text("admin:Sum:mer:2025!\n")
+    a = nxa.NxcAutomator(target="x", combo=str(combo), no_banner=True)
+    c = a.credentials[0]
+    assert c.user == "admin" and c.password == "Sum:mer:2025!"
+
+
+def test_combo_without_spray_keeps_one_to_one_pairs(nxa, tmp_path):
+    combo = tmp_path / "combo.txt"
+    combo.write_text("alice:Spring1\nbob:Summer2\n")
+    a = nxa.NxcAutomator(target="x", combo=str(combo), no_banner=True)
+    assert {(c.user, c.password) for c in a.credentials} == {("alice", "Spring1"), ("bob", "Summer2")}
+
+
+def test_combo_spray_expands_to_cartesian(nxa, tmp_path):
+    """--combo-spray tries every secret on every user, like -u users -p pwds."""
+    combo = tmp_path / "combo.txt"
+    combo.write_text("alice:Spring1\nbob:Summer2\n")
+    a = nxa.NxcAutomator(target="x", combo=str(combo), combo_spray=True, no_banner=True)
+    assert {(c.user, c.password) for c in a.credentials} == {
+        ("alice", "Spring1"), ("alice", "Summer2"),
+        ("bob", "Spring1"), ("bob", "Summer2"),
+    }

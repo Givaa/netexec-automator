@@ -409,3 +409,13 @@ def test_unknown_flag_points_to_help(tmp_path):
     assert rc == 2
     assert "error" in err.lower()
     assert "--help" in err
+
+
+def test_combo_spray_requires_combo(tmp_path):
+    """--combo-spray only makes sense with --combo."""
+    rc, _, err = run_tool(
+        ["-t", "10.0.0.5", "-u", "u", "-p", "p", "--combo-spray", "--no-cmd-log"],
+        cwd=tmp_path,
+    )
+    assert rc == 2
+    assert "--combo-spray" in err

@@ -55,6 +55,7 @@ class NxcAutomator:
         password: str | None = None,
         nthash: str | None = None,
         combo: str | None = None,
+        combo_spray: bool = False,
         domain: str | None = None,
         kerberos: bool = False,
         null_session: bool = False,
@@ -112,6 +113,7 @@ class NxcAutomator:
         self.password_arg = password
         self.hash_arg = nthash
         self.combo_arg = combo
+        self.combo_spray = combo_spray
 
         # Kept for banner display
         self.users = self._read_value_or_file(user) if user else []
@@ -357,6 +359,30 @@ class NxcAutomator:
             raise ValueError(f"Combo file {path!r} contained no usable credentials.")
         return creds
 
+    @staticmethod
+    def _spray_from_combo(combo_creds: list[Credential]) -> list[Credential]:
+        """Expand 1:1 combo pairs into a full spray: every distinct secret tried
+        against every distinct user (cartesian) — like `-u users -p passwords`.
+        Passwords and hashes are kept as separate pools; order is preserved and
+        duplicates collapsed."""
+        users = list(dict.fromkeys(c.user for c in combo_creds))
+        passwords = list(dict.fromkeys(
+            c.password for c in combo_creds if not c.is_hash and c.password is not None
+        ))
+        hashes: list[tuple[str | None, str]] = []
+        seen: set[tuple[str | None, str]] = set()
+        for c in combo_creds:
+            if c.is_hash:
+                key = (c.lmhash, c.nthash)
+                if key not in seen:
+                    seen.add(key)
+                    hashes.append(key)
+        out: list[Credential] = []
+        for u in users:
+            out.extend(Credential(user=u, password=p) for p in passwords)
+            out.extend(Credential(user=u, lmhash=lm, nthash=nt) for lm, nt in hashes)
+        return out
+
     def _build_credentials(self) -> list[Credential]:
         """Compose the credential list from null/guest, combo file, or -u/-p/-H pools."""
         creds: list[Credential] = []
@@ -377,7 +403,11 @@ class NxcAutomator:
         if self.combo_arg:
             if self.password_arg or self.hash_arg or self.user_arg:
                 raise ValueError("--combo cannot be combined with -u/-p/-H.")
-            creds.extend(self._load_combo_file(self.combo_arg))
+            combo_creds = self._load_combo_file(self.combo_arg)
+            # --combo-spray: treat the combo's users and secrets as pools and
+            # spray every secret against every user (cartesian), like
+            # -u users -p passwords, instead of only the 1:1 user:secret pairs.
+            creds.extend(self._spray_from_combo(combo_creds) if self.combo_spray else combo_creds)
             return creds
 
         # If only null-session was requested (no -u), that's a valid configuration.
@@ -2407,28 +2437,38 @@ class NxcAutomator:
         krb_count = sum(h.get("count", 0) for h in self.harvested_hashes if "kerberos_file" in h)
         bh_ok = [b for b in self.bloodhound_results if b.get("success")]
 
-        # Compute a sensible host-column width across all rows that will be printed
-        cred_hosts = [self._format_host_tag(v["host"]) for v in self.valid_creds]
-        host_w = min(40, max((len(h) for h in cred_hosts), default=18))
-
         print(f"\n{BOLD}{CYAN}{'═' * 72}{RESET}")
         print(f"  {CYAN}{BOLD}📋 FINAL REPORT{RESET}")
         print(f"{BOLD}{CYAN}{'═' * 72}{RESET}\n")
 
-        if pwn3d:
-            print(f"  {ICON_PWN3D} {RED}{BOLD}ADMIN PWN3D ({len(pwn3d)}){RESET}")
-            for v in pwn3d:
-                label = self._task_label(v["protocol"], v["local_auth"])
-                tag = self._format_host_tag(v["host"], host_w)
-                print(f"     {RED}{tag}{RESET} {DIM}→{RESET} {BOLD}{label:<15}{RESET} {RED}{v['raw']}{RESET}")
+        # Host-centric view: hosts you fully own (admin / Pwn3d) come first —
+        # "this host is yours" — then hosts where creds hit but you're not admin.
+        by_host: dict[str, list[dict]] = {}
+        for v in self.valid_creds:
+            by_host.setdefault(v["host"], []).append(v)
+        owned_hosts = [h for h, vs in by_host.items() if any(self._is_pwn3d(v["raw"]) for v in vs)]
+        valid_only_hosts = [h for h in by_host if h not in owned_hosts]
+
+        if owned_hosts:
+            print(f"  {ICON_PWN3D} {RED}{BOLD}OWNED — full admin on {len(owned_hosts)} host(s){RESET}")
+            for host in owned_hosts:
+                tag = self._format_host_tag(host)
+                print(f"     {RED}{BOLD}💀 {tag} — you have admin here{RESET}")
+                for v in by_host[host]:
+                    label = self._task_label(v["protocol"], v["local_auth"])
+                    pwned = self._is_pwn3d(v["raw"])
+                    mark = f"{RED}{BOLD}👑{RESET}" if pwned else f"{DIM}··{RESET}"
+                    color = RED if pwned else GREEN
+                    print(f"        {mark} {DIM}{label:<14}{RESET} {color}{v['raw']}{RESET}")
             print()
 
-        if others:
-            print(f"  {ICON_FINDING} {GREEN}{BOLD}VALID CREDENTIALS ({len(others)}){RESET}")
-            for v in others:
-                label = self._task_label(v["protocol"], v["local_auth"])
-                tag = self._format_host_tag(v["host"], host_w)
-                print(f"     {GREEN}{tag}{RESET} {DIM}→{RESET} {BOLD}{label:<15}{RESET} {GREEN}{v['raw']}{RESET}")
+        if valid_only_hosts:
+            print(f"  {ICON_FINDING} {GREEN}{BOLD}VALID CREDS — {len(valid_only_hosts)} host(s), no admin yet{RESET}")
+            for host in valid_only_hosts:
+                print(f"     {GREEN}{self._format_host_tag(host)}{RESET}")
+                for v in by_host[host]:
+                    label = self._task_label(v["protocol"], v["local_auth"])
+                    print(f"        {DIM}{label:<14}{RESET} {GREEN}{v['raw']}{RESET}")
             print()
 
         if nt_count or krb_count:

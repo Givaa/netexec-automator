@@ -173,6 +173,9 @@ def _build_parser():
                         help="Use Kerberos auth (-k). Requires valid ccache via KRB5CCNAME.")
     g_auth.add_argument("--combo",
                         help="Combo file (user:secret per line). Auto-detects password vs NT/LM:NT hash.")
+    g_auth.add_argument("--combo-spray", action="store_true",
+                        help="With --combo, spray every secret against every user (cartesian), like "
+                             "-u users -p passwords — instead of only the 1:1 user:secret pairs.")
     g_auth.add_argument("--null-session", action="store_true",
                         help="Also probe anonymous/null logins as cheap quick-wins: null session, "
                              "Guest:'' and anonymous:'' on every protocol, plus FTP's classic "
@@ -393,6 +396,10 @@ def _validate_args(args, parser):
         parser.error("--combo cannot be combined with -u/-p/-H "
                      "(combo lines carry the user already).")
 
+    if args.combo_spray and not args.combo:
+        parser.error("--combo-spray only applies to --combo. Use -u/-p with the "
+                     "default combination mode to spray separate user/password lists.")
+
     # --exam-safe: refuse at startup if any requested module is an automated
     # exploitation module. Matched case-insensitively, '-'/'_' interchangeable.
     if args.exam_safe and args.modules:
@@ -546,6 +553,7 @@ def main():
             password=args.password,
             nthash=args.nthash,
             combo=args.combo,
+            combo_spray=args.combo_spray,
             domain=args.domain,
             kerberos=args.kerberos,
             null_session=args.null_session,

@@ -239,7 +239,16 @@ class HashCracker:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            h, _, p = line.rpartition(":")
+            # potfile is 'hash:plaintext'. An NT hash is exactly 32 hex with no
+            # ':', so the plaintext is everything after the FIRST colon — this
+            # preserves colons inside the cracked password (e.g. 'Sum:mer:25').
+            # Kerberos hashes embed ':' in the hash itself, so for those fall
+            # back to splitting on the last colon.
+            head = line.split(":", 1)[0]
+            if HASH_NT_PATTERN.match(head):
+                h, p = head, line[len(head) + 1:]
+            else:
+                h, _, p = line.rpartition(":")
             if h and p:
                 out.append((h, p))
         return out

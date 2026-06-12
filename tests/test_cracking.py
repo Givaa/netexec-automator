@@ -125,3 +125,12 @@ def test_kerberos_user_regex(nxa):
     tgs = "$krb5tgs$23$*svc_sql$CORP.LOCAL$mssql/dc01*$abcdef..."
     m = nxa.KRB_TGS_REP_USER_RE.search(tgs)
     assert m and m.group(1) == "svc_sql"
+
+
+def test_parse_potfile_nt_password_with_colon(nxa):
+    """A cracked NT plaintext containing ':' must be kept whole — split on the
+    FIRST colon after the 32-hex hash, not truncated by the last colon (which
+    used to drop the crack entirely once _belongs_to rejected the bad hash)."""
+    text = "8846f7eaee8fb117ad06bdd830b7586c:Sum:mer:2025!\n"
+    pairs = nxa.HashCracker._parse_potfile(text)
+    assert ("8846f7eaee8fb117ad06bdd830b7586c", "Sum:mer:2025!") in pairs
