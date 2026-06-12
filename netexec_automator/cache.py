@@ -247,6 +247,23 @@ class HostCache:
             row = self._conn.execute("SELECT COUNT(*) FROM tried_creds").fetchone()
         return int(row[0]) if row else 0
 
+    # Every table this cache owns — wiped together by reset().
+    _ALL_TABLES = ("host_ports", "tried_creds", "domain_controllers", "bloodhound_runs")
+
+    def reset(self) -> dict[str, int]:
+        """Wipe ALL cached state — port scans, tried creds + loot, DC
+        discoveries and BloodHound runs — for a clean start on a new
+        engagement. Returns {table: rows_deleted}. Table names are a fixed
+        internal allow-list (no injection)."""
+        counts: dict[str, int] = {}
+        with self._lock:
+            for table in self._ALL_TABLES:
+                n = self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                self._conn.execute(f"DELETE FROM {table}")
+                counts[table] = int(n)
+            self._conn.commit()
+        return counts
+
     def list_valid(self) -> list[tuple[str, str, bool, str, str | None, bool]]:
         """Return prior *successful* credentials as
         (target, protocol, local_auth, user, domain, pwn3d), Pwn3d first.

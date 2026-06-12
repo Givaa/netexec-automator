@@ -255,3 +255,38 @@ def test_detect_dc_extracts_name(nxa):
     a._detect_dc_from_results("10.10.10.5", results, open_ports={445, 389})
     assert a.host_names["10.10.10.5"] == "DC01"
     assert a.host_domain["10.10.10.5"] == "corp.local"
+
+
+# ---- auth scope: both local-auth and domain are sprayed -----------------
+
+def test_build_protocol_tasks_covers_both_local_and_domain(nxa):
+    """Every local-auth-capable protocol (smb/wmi/winrm/rdp/mssql) must be
+    sprayed BOTH as domain auth and as local auth; non-local protocols (ssh,
+    ldap, ...) get domain only. Guards the 'try both scopes' guarantee."""
+    a = nxa.NxcAutomator(target="x", user="u", password="p")
+    tasks = a._build_protocol_tasks(open_ports=None)  # nmap-off: all protocols
+    assert ("smb", False) in tasks and ("smb", True) in tasks      # domain + local
+    assert ("ssh", False) in tasks and ("ssh", True) not in tasks  # domain only
+    assert ("ldap", False) in tasks and ("ldap", True) not in tasks
+
+
+# ---- print_loot_on_record (shared by --show + end-of-run reminder) ------
+
+def test_print_loot_on_record_groups_by_domain(nxa, capsys):
+    rows = [
+        ("10.0.0.5", "smb", False, "administrator", "corp.local", True),
+        ("10.0.0.6", "smb", True,  "localadmin",    "corp.local", False),
+        ("172.16.0.9", "ssh", False, "root",        None,         False),
+    ]
+    nxa.NxcAutomator.print_loot_on_record(rows)
+    out = strip_ansi(capsys.readouterr().out)
+    assert "LOOT ON RECORD (3 valid · 1 Pwn3d)" in out
+    assert "corp.local" in out and "(no domain / local)" in out
+    assert "administrator@10.0.0.5" in out and "(Pwn3d!)" in out
+    assert "[smb/local]" in out  # auth scope shown
+
+
+def test_print_loot_on_record_empty_says_nothing_on_record(nxa, capsys):
+    nxa.NxcAutomator.print_loot_on_record([])
+    out = strip_ansi(capsys.readouterr().out)
+    assert "no valid credentials on record" in out.lower()

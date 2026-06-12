@@ -807,6 +807,74 @@ class NxcAutomator:
         head = f"{len(rows)} valid" + (f" · {pwn} Pwn3d" if pwn else "")
         return f"{head} — {', '.join(samples)}{more}"
 
+    def _memory_summary(self) -> str:
+        """One-line cache-memory summary for the startup menu: how many prior
+        attempts we remember + valid creds already on record for these targets
+        (with a couple of samples). '' when there's no cache / nothing yet.
+        Merges what used to be the separate 'Incremental' + 'Prior loot' rows."""
+        if not self.cache:
+            return ""
+        try:
+            tried_n = self.cache.count_tried()
+        except Exception:  # noqa: BLE001 — the banner must never crash a run
+            return ""
+        parts: list[str] = []
+        if tried_n:
+            parts.append(f"{tried_n} tried")
+        prior = self._prior_findings_summary()
+        if prior:
+            parts.append(prior)
+        if self.rerun_after and tried_n:
+            parts.append(f"rerun>{self.rerun_after}s")
+        return " · ".join(parts)
+
+    @staticmethod
+    def print_loot_on_record(rows, cache_path=None):
+        """Render accumulated valid creds — cache.list_valid() rows of
+        (target, protocol, local_auth, user, domain, pwn3d) — grouped by
+        domain. Shared by `--show` and the end-of-run reminder. Secrets are
+        never shown (only the hash is stored), so this is safe to print."""
+        if not rows:
+            loc = f" at {cache_path}" if cache_path else ""
+            print(f"  {DIM}no valid credentials on record{loc} yet.{RESET}")
+            return
+        grouped: dict[str, list] = {}
+        for target, proto, local_auth, user, domain, pwn3d in rows:
+            grouped.setdefault(domain or "(no domain / local)", []).append(
+                (target, proto, local_auth, user, pwn3d)
+            )
+        total = len(rows)
+        pwn = sum(1 for r in rows if r[5])
+        head = f"{total} valid" + (f" · {pwn} Pwn3d" if pwn else "")
+        print(f"\n  {ICON_FINDING} {CYAN}{BOLD}LOOT ON RECORD ({head}){RESET}")
+        for domain in sorted(grouped):
+            drows = grouped[domain]
+            print(f"     {BOLD}{domain}{RESET} {DIM}({len(drows)}){RESET}")
+            for target, proto, local_auth, user, pwn3d in drows:
+                scope = NxcAutomator._auth_scope(local_auth)
+                marker = f" {RED}{BOLD}(Pwn3d!){RESET}" if pwn3d else ""
+                print(f"        {GREEN}{user or '<empty>'}{RESET}{DIM}@{RESET}{target} "
+                      f"{DIM}[{proto}/{scope}]{RESET}{marker}")
+        print()
+
+    def _print_loot_reminder(self):
+        """End-of-run: if the cache holds valid creds BEYOND what this run just
+        found (accumulated loot from prior runs), print the full by-domain
+        ledger as a reminder. Skipped when this run is the only source — the
+        FINAL REPORT already covered those, so we avoid the redundancy."""
+        if self.verbosity <= V_QUIET or not self.cache:
+            return
+        try:
+            record = self.cache.list_valid()
+        except Exception:  # noqa: BLE001 — never let the reminder crash a run
+            return
+        this_run = {
+            (v["host"], v["protocol"], v["local_auth"], v["credential"].user)
+            for v in self.valid_creds
+        }
+        if any((r[0], r[1], r[2], r[3]) not in this_run for r in record):
+            self.print_loot_on_record(record)
+
     # ---- banner rendering -------------------------------------------------
 
     # The decorative banner is exactly _BANNER_WIDTH columns wide. The
@@ -868,15 +936,9 @@ class NxcAutomator:
                 crack_str += f" · rules={Path(self.cracker.rules).name}"
             rows.append(("Cracking", crack_str, None, None))
 
-        if self.skip_tried and self.cache is not None:
-            tried_n = self.cache.count_tried()
-            rerun = f"rerun-after={self.rerun_after}s" if self.rerun_after else "no rerun"
-            rows.append(("Incremental", f"skip-tried · {tried_n} prior entries · {rerun}",
-                         None, None))
-
-        prior = self._prior_findings_summary()
-        if prior:
-            rows.append(("Prior loot", prior, None, None))
+        memory = self._memory_summary()
+        if memory:
+            rows.append(("Memory", memory, None, None))
 
         # Header / footer bar at the same width as the decorative banner.
         bar = "─" * self._BANNER_WIDTH
@@ -2285,6 +2347,7 @@ class NxcAutomator:
                 self._write_exports()
 
             self._print_final_report()
+            self._print_loot_reminder()
             self._print_run_diagnostics()
         finally:
             if self.cache:

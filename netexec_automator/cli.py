@@ -79,33 +79,37 @@ def _load_toml_config(path: str) -> dict:
 
 EXAMPLES_EPILOG = """\
 examples:
+  # nmap pre-scan and incremental spray (remember prior attempts) are ON by
+  # default — every run learns open ports per host and only sprays new combos.
+
   # 1. Single host, single credential — quickest possible run
   %(prog)s -t 10.10.10.5 -u admin -p 'Password123!'
 
-  # 2. File-based spray across a CIDR with nmap pre-scan (skips dead hosts/protocols)
-  %(prog)s -t targets.txt -u users.txt -p passwords.txt --nmap
+  # 2. File-based spray across a CIDR (dead hosts / closed protocols are skipped)
+  %(prog)s -t targets.txt -u users.txt -p passwords.txt
 
   # 3. Combo file with mixed passwords + NT/LM:NT hashes (auto-detected per line)
-  %(prog)s -t targets.txt --combo loot.txt --nmap
+  %(prog)s -t targets.txt --combo loot.txt
 
   # 4. Pass-the-hash with explicit domain
   %(prog)s -t dc01 -u administrator -H 8846f7eaee8fb117ad06bdd830b7586c -d corp.local
 
-  # 5. Anonymous quick-wins before the main spray
-  %(prog)s -t targets.txt -u users.txt -p passwords.txt --null-session
-
-  # 6. Full chain: pre-scan, spray, post-exploit enum, BloodHound, verbose
-  %(prog)s -t 10.10.10.0/24 --combo loot.txt --nmap --null-session \\
+  # 5. Full chain: spray, post-exploit enum, BloodHound, verbose
+  %(prog)s -t 10.10.10.0/24 --combo loot.txt --null-session \\
            --enum --modules spider_plus,gpp_password --bloodhound -v
 
-  # 7. Recon only — discover open ports without firing any nxc auth attempts
+  # 6. Recon only — discover open ports without firing any nxc auth attempts
   %(prog)s -t 10.10.10.0/24 -u x -p x --scan-only
 
-  # 8. Low-power profile for VMs / weak hosts — 3 workers, 1 retry, paced
-  %(prog)s -t targets.txt --combo loot.txt --nmap --low-power
+  # 7. Spray without nmap (every protocol on every host), low-power VM profile
+  %(prog)s -t targets.txt --combo loot.txt --no-nmap --low-power
 
-  # 9. Quiet mode (only valid creds) — handy for piping
-  %(prog)s -t targets.txt --combo loot.txt --nmap -q
+  # 8. See the loot you already have, then start a new engagement clean
+  %(prog)s --show
+  %(prog)s --reset
+
+  # 9. Force a full re-spray (ignore what was already tried), quiet output
+  %(prog)s -t targets.txt --combo loot.txt --retry-all -q
 """
 
 
@@ -163,8 +167,7 @@ def _build_parser():
 
     # ----- Pre-scan -----
     g_scan = parser.add_argument_group("nmap pre-scan & cache")
-    g_scan.add_argument("--nmap", action="store_true",
-                        help="(Deprecated — the nmap pre-scan is on by default now; this flag is a harmless no-op.)")
+    g_scan.add_argument("--nmap", action="store_true", help=argparse.SUPPRESS)  # deprecated no-op: pre-scan is on by default
     g_scan.add_argument("--no-nmap", action="store_true",
                         help="Disable the nmap pre-scan and spray every protocol on every target "
                              "(the old default). Use where nmap isn't available or wanted.")
@@ -184,9 +187,7 @@ def _build_parser():
     g_scan.add_argument("--cache-path",
                         help=f"Custom SQLite cache path (default: {CACHE_DEFAULT_PATH}). Use this to "
                              "isolate concurrent / CI runs from each other.")
-    g_scan.add_argument("--skip-tried", action="store_true",
-                        help="(Deprecated — incremental spray is on by default now; this flag is a "
-                             "harmless no-op.)")
+    g_scan.add_argument("--skip-tried", action="store_true", help=argparse.SUPPRESS)  # deprecated no-op: incremental spray is on by default
     g_scan.add_argument("--retry-all", "--no-skip-tried", dest="retry_all", action="store_true",
                         help="Re-spray every (target, protocol, scope, user, secret) combination "
                              "even if it was already tried in a prior run. By default the tool "
@@ -197,9 +198,13 @@ def _build_parser():
                         help="Re-attempt past *failures* older than this many seconds (default: "
                              "0 = never re-attempt failures). Successes are still always skipped. "
                              "No effect with --retry-all.")
-    g_scan.add_argument("--clear-tried-cache", action="store_true",
-                        help="Wipe the tried_creds table from the cache and exit. Use this when "
-                             "you want --skip-tried to start fresh.")
+    g_scan.add_argument("--show", action="store_true",
+                        help="Print the valid credentials already on record (grouped by domain) and exit. "
+                             "Reads the cache; never prints secrets — only the hash is stored.")
+    g_scan.add_argument("--reset", action="store_true",
+                        help="Wipe ALL cached state — port scans, tried creds + loot, DC & BloodHound "
+                             "discoveries — for a clean start on a new engagement, and exit.")
+    g_scan.add_argument("--clear-tried-cache", action="store_true", help=argparse.SUPPRESS)  # deprecated: superseded by --reset
     g_scan.add_argument("--no-reachability-check", action="store_true",
                         help="Skip the stdlib TCP-connect reachability probe done when --nmap is off. "
                              "By default a quick probe to common ports decides whether a single-host "
@@ -470,20 +475,38 @@ def main():
             sys.exit(2)
         sys.exit(subprocess.call(["bash", str(script)]))
 
-    if args.clear_tried_cache:
-        # One-shot maintenance: wipe the tried_creds table and exit. Honors
-        # --cache-path so concurrent CI runs can clear their own DB.
+    # One-shot cache/state operations that run and exit (no target needed).
+    # All honour --cache-path so concurrent / CI runs touch their own DB.
+    if args.reset or args.show or args.clear_tried_cache:
         from .cache import HostCache
         cache_path = Path(args.cache_path).expanduser() if args.cache_path else CACHE_DEFAULT_PATH
+
+        if args.show:
+            rows = []
+            if cache_path.exists():
+                cache = HostCache(cache_path, ttl=args.cache_ttl)
+                try:
+                    rows = cache.list_valid()
+                finally:
+                    cache.close()
+            NxcAutomator.print_loot_on_record(rows, cache_path)
+            sys.exit(0)
+
         if not cache_path.exists():
-            print(f"{DIM}cache file does not exist at {cache_path} — nothing to clear{RESET}")
+            print(f"{DIM}cache file does not exist at {cache_path} — nothing to {'reset' if args.reset else 'clear'}{RESET}")
             sys.exit(0)
         cache = HostCache(cache_path, ttl=args.cache_ttl)
         try:
-            n = cache.clear_tried_cache()
+            if args.reset:
+                counts = cache.reset()
+                total = sum(counts.values())
+                detail = ", ".join(f"{k}={v}" for k, v in counts.items() if v) or "already empty"
+                print(f"reset {cache_path}: wiped {total} row(s) ({detail})")
+            else:  # --clear-tried-cache (deprecated alias for the loot-only wipe)
+                n = cache.clear_tried_cache()
+                print(f"cleared {n} tried_creds entries from {cache_path}")
         finally:
             cache.close()
-        print(f"cleared {n} tried_creds entries from {cache_path}")
         sys.exit(0)
 
     if not args.target:

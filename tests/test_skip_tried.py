@@ -144,3 +144,26 @@ def test_skip_tried_default_off(nxa):
     a = nxa.NxcAutomator(target="x", user="u", password="p")
     assert a.skip_tried is False
     assert a.skipped_already_tried == 0
+
+
+# ---- reset() (the --reset full wipe) -------------------------------------
+
+def test_reset_wipes_all_tables(cache):
+    """--reset must clear every table for a clean new engagement, not just
+    tried_creds — port scans, loot, DC discoveries and BloodHound runs."""
+    cache.store("10.0.0.5", {445: "open"})
+    cache.record_attempt("10.0.0.5", "smb", False, "admin", "h", "corp.local", "ok", pwn3d=True)
+    cache.record_dc("corp.local", "10.0.0.5", "smb_banner")
+    cache.record_bloodhound("corp.local", "10.0.0.5", "admin", "/tmp/bh", True)
+
+    counts = cache.reset()
+
+    assert counts["host_ports"] >= 1
+    assert counts["tried_creds"] == 1
+    assert counts["domain_controllers"] == 1
+    assert counts["bloodhound_runs"] == 1
+    # Everything is gone afterwards.
+    assert cache.get_fresh("10.0.0.5") is None
+    assert cache.count_tried() == 0
+    assert cache.list_valid() == []
+    assert cache.get_dcs("corp.local") == []
