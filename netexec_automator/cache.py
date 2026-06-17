@@ -264,19 +264,63 @@ class HostCache:
             self._conn.commit()
         return counts
 
-    def list_valid(self) -> list[tuple[str, str, bool, str, str | None, bool]]:
+    # Domain-scoped tables (host_ports has no domain column — port scans are
+    # domain-agnostic, so scoped resets leave them be).
+    _DOMAIN_TABLES = ("tried_creds", "domain_controllers", "bloodhound_runs")
+
+    @staticmethod
+    def _is_local_token(domain: str) -> bool:
+        """A name the operator uses to mean 'the domain-less local creds'."""
+        return domain.strip().lower() in ("local", "", "-", "none", "workgroup")
+
+    def reset_domain(self, domain: str) -> dict[str, int]:
+        """Wipe loot + discoveries for ONE domain (tried_creds, domain_controllers,
+        bloodhound_runs); host_ports is left untouched. Pass 'local' to target
+        the domain-less (local-auth) creds. Returns {table: rows_deleted}."""
+        local = self._is_local_token(domain)
+        d = domain.strip().lower()
+        counts: dict[str, int] = {}
+        with self._lock:
+            for table in self._DOMAIN_TABLES:
+                if local:
+                    cur = self._conn.execute(f"DELETE FROM {table} WHERE domain IS NULL")
+                else:
+                    cur = self._conn.execute(
+                        f"DELETE FROM {table} WHERE lower(domain) = ?", (d,)
+                    )
+                counts[table] = cur.rowcount
+            self._conn.commit()
+        return counts
+
+    def reset_except(self, domain: str) -> dict[str, int]:
+        """Keep ONE domain's loot + discoveries, wipe everyone else's (including
+        the domain-less local creds); host_ports is left untouched."""
+        d = domain.strip().lower()
+        counts: dict[str, int] = {}
+        with self._lock:
+            for table in self._DOMAIN_TABLES:
+                cur = self._conn.execute(
+                    f"DELETE FROM {table} WHERE domain IS NULL OR lower(domain) <> ?", (d,)
+                )
+                counts[table] = cur.rowcount
+            self._conn.commit()
+        return counts
+
+    def list_valid(self) -> list[tuple[str, str, bool, str, str | None, bool, int]]:
         """Return prior *successful* credentials as
-        (target, protocol, local_auth, user, domain, pwn3d), Pwn3d first.
-        These are the rows where auth worked (result='ok') or granted admin
-        (pwn3d=1). Secrets are never returned — only the hash is stored — so
-        this is safe to surface in the UI. Valid creds are rare, so callers
-        filter to the current targets in Python rather than via SQL."""
+        (target, protocol, local_auth, user, domain, pwn3d, attempted_at),
+        Pwn3d first. These are the rows where auth worked (result='ok') or
+        granted admin (pwn3d=1). Secrets are never returned — only the hash is
+        stored — so this is safe to surface in the UI. attempted_at (unix ts)
+        lets the UI cluster domain-less local creds by when they were found.
+        Valid creds are rare, so callers filter to current targets in Python."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT target, protocol, local_auth, user, domain, pwn3d FROM tried_creds "
-                "WHERE result = 'ok' OR pwn3d = 1 ORDER BY pwn3d DESC, target, user"
+                "SELECT target, protocol, local_auth, user, domain, pwn3d, attempted_at "
+                "FROM tried_creds WHERE result = 'ok' OR pwn3d = 1 "
+                "ORDER BY pwn3d DESC, target, user"
             ).fetchall()
-        return [(t, p, bool(la), u, d, bool(pw)) for t, p, la, u, d, pw in rows]
+        return [(t, p, bool(la), u, d, bool(pw), int(ts)) for t, p, la, u, d, pw, ts in rows]
 
     def close(self):
         self._conn.close()

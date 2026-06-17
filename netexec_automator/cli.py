@@ -222,9 +222,14 @@ def _build_parser():
     g_scan.add_argument("--show", action="store_true",
                         help="Print the valid credentials already on record (grouped by domain) and exit. "
                              "Reads the cache; never prints secrets — only the hash is stored.")
-    g_scan.add_argument("--reset", action="store_true",
-                        help="Wipe ALL cached state — port scans, tried creds + loot, DC & BloodHound "
-                             "discoveries — for a clean start on a new engagement, and exit.")
+    g_scan.add_argument("--reset", nargs="?", const="__ALL__", default=None, metavar="DOMAIN",
+                        help="Wipe cached state and exit. No value = everything (port scans, tried "
+                             "creds + loot, DC & BloodHound). With a DOMAIN = only that domain's "
+                             "loot/DC/BloodHound (use 'local' for the domain-less local creds; port "
+                             "scans, which have no domain, are kept).")
+    g_scan.add_argument("--reset-except", metavar="DOMAIN",
+                        help="Wipe every domain's loot/DC/BloodHound EXCEPT DOMAIN (plus the "
+                             "domain-less local creds), then exit. Port scans are kept.")
     g_scan.add_argument("--clear-tried-cache", action="store_true", help=argparse.SUPPRESS)  # deprecated: superseded by --reset
     g_scan.add_argument("--no-reachability-check", action="store_true",
                         help="Skip the stdlib TCP-connect reachability probe done when --nmap is off. "
@@ -502,7 +507,9 @@ def main():
 
     # One-shot cache/state operations that run and exit (no target needed).
     # All honour --cache-path so concurrent / CI runs touch their own DB.
-    if args.reset or args.show or args.clear_tried_cache:
+    if args.reset is not None or args.reset_except or args.show or args.clear_tried_cache:
+        if args.reset is not None and args.reset_except:
+            parser.error("--reset and --reset-except are mutually exclusive — pick one.")
         from .cache import HostCache
         cache_path = Path(args.cache_path).expanduser() if args.cache_path else CACHE_DEFAULT_PATH
 
@@ -518,18 +525,25 @@ def main():
             sys.exit(0)
 
         if not cache_path.exists():
-            print(f"{DIM}cache file does not exist at {cache_path} — nothing to {'reset' if args.reset else 'clear'}{RESET}")
+            print(f"{DIM}cache file does not exist at {cache_path} — nothing to clear{RESET}")
             sys.exit(0)
         cache = HostCache(cache_path, ttl=args.cache_ttl)
         try:
-            if args.reset:
+            if args.reset_except:
+                counts = cache.reset_except(args.reset_except)
+                scope = f"everything except domain '{args.reset_except}'"
+            elif args.reset == "__ALL__":
                 counts = cache.reset()
-                total = sum(counts.values())
-                detail = ", ".join(f"{k}={v}" for k, v in counts.items() if v) or "already empty"
-                print(f"reset {cache_path}: wiped {total} row(s) ({detail})")
+                scope = "all cached state"
+            elif args.reset is not None:  # --reset DOMAIN (scoped)
+                counts = cache.reset_domain(args.reset)
+                scope = f"domain '{args.reset}'"
             else:  # --clear-tried-cache (deprecated alias for the loot-only wipe)
-                n = cache.clear_tried_cache()
-                print(f"cleared {n} tried_creds entries from {cache_path}")
+                counts = {"tried_creds": cache.clear_tried_cache()}
+                scope = "tried-creds cache"
+            total = sum(counts.values())
+            detail = ", ".join(f"{k}={v}" for k, v in counts.items() if v) or "already empty"
+            print(f"reset {scope} in {cache_path}: wiped {total} row(s) ({detail})")
         finally:
             cache.close()
         sys.exit(0)

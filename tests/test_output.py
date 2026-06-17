@@ -277,18 +277,22 @@ def test_build_protocol_tasks_covers_both_local_and_domain(nxa):
 
 # ---- print_loot_on_record (shared by --show + end-of-run reminder) ------
 
-def test_print_loot_on_record_groups_by_domain(nxa, capsys):
+def test_print_loot_on_record_groups_by_domain_and_local_by_day(nxa, capsys):
+    import datetime as _dt
+    ts = int(_dt.datetime(2026, 6, 3, 14, 30).timestamp())
     rows = [
-        ("10.0.0.5", "smb", False, "administrator", "corp.local", True),
-        ("10.0.0.6", "smb", True,  "localadmin",    "corp.local", False),
-        ("172.16.0.9", "ssh", False, "root",        None,         False),
+        ("10.0.0.5", "smb", False, "administrator", "corp.local", True,  ts),
+        ("10.0.0.6", "smb", True,  "localadmin",    "corp.local", False, ts),
+        ("172.16.0.9", "ssh", False, "root",        None,         False, ts),  # local → grouped by day
     ]
     nxa.NxcAutomator.print_loot_on_record(rows)
     out = strip_ansi(capsys.readouterr().out)
     assert "LOOT ON RECORD (3 valid · 1 Pwn3d)" in out
-    assert "corp.local" in out and "(no domain / local)" in out
+    assert "corp.local" in out and "local / no domain" in out
     assert "administrator@10.0.0.5" in out and "(Pwn3d!)" in out
-    assert "[smb/local]" in out  # auth scope shown
+    assert "[smb/local]" in out          # auth scope shown
+    assert "2026-06-03" in out           # local creds clustered by day
+    assert "root@172.16.0.9" in out
 
 
 def test_print_loot_on_record_empty_says_nothing_on_record(nxa, capsys):

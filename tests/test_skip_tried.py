@@ -69,8 +69,10 @@ def test_list_valid_returns_successes_pwn3d_first(cache):
     cache.record_attempt("10.0.0.6", "smb", True, "admin", "h3", None, "ok", pwn3d=True)  # pwn3d
     rows = cache.list_valid()
     assert len(rows) == 2
-    assert rows[0] == ("10.0.0.6", "smb", True, "admin", None, True)   # Pwn3d first
-    assert ("10.0.0.5", "smb", False, "alice", None, False) in rows
+    # rows are (target, protocol, local_auth, user, domain, pwn3d, attempted_at)
+    assert rows[0][:6] == ("10.0.0.6", "smb", True, "admin", None, True)   # Pwn3d first
+    assert isinstance(rows[0][6], int) and rows[0][6] > 0                  # timestamp present
+    assert any(r[:6] == ("10.0.0.5", "smb", False, "alice", None, False) for r in rows)
     # secret hashes never appear in the returned tuples
     assert all(h not in str(r) for r in rows for h in ("h1", "h2", "h3"))
 
@@ -167,3 +169,38 @@ def test_reset_wipes_all_tables(cache):
     assert cache.count_tried() == 0
     assert cache.list_valid() == []
     assert cache.get_dcs("corp.local") == []
+
+
+# ---- scoped reset (--reset DOMAIN / --reset-except DOMAIN) ---------------
+
+def test_reset_domain_scopes_to_one_domain(cache):
+    cache.record_attempt("10.0.0.5", "smb", False, "a", "h1", "corp.local", "ok", pwn3d=True)
+    cache.record_attempt("10.0.0.9", "smb", False, "b", "h2", "other.local", "ok")
+    cache.record_attempt("172.16.0.1", "ssh", False, "root", "h3", None, "ok")  # local
+    cache.store("10.0.0.5", {445: "open"})  # port scan must survive a scoped reset
+    counts = cache.reset_domain("corp.local")
+    assert counts["tried_creds"] == 1
+    remaining = {(r[0], r[4]) for r in cache.list_valid()}
+    assert ("10.0.0.5", "corp.local") not in remaining
+    assert ("10.0.0.9", "other.local") in remaining
+    assert ("172.16.0.1", None) in remaining          # local creds untouched
+    assert cache.get_fresh("10.0.0.5") is not None     # host_ports untouched
+
+
+def test_reset_domain_local_targets_null_domain(cache):
+    cache.record_attempt("172.16.0.1", "ssh", False, "root", "h1", None, "ok")
+    cache.record_attempt("10.0.0.5", "smb", False, "a", "h2", "corp.local", "ok")
+    counts = cache.reset_domain("local")
+    assert counts["tried_creds"] == 1
+    remaining = {(r[0], r[4]) for r in cache.list_valid()}
+    assert ("172.16.0.1", None) not in remaining       # the local creds are gone
+    assert ("10.0.0.5", "corp.local") in remaining
+
+
+def test_reset_except_keeps_only_one_domain(cache):
+    cache.record_attempt("10.0.0.5", "smb", False, "a", "h1", "corp.local", "ok")
+    cache.record_attempt("10.0.0.9", "smb", False, "b", "h2", "other.local", "ok")
+    cache.record_attempt("172.16.0.1", "ssh", False, "root", "h3", None, "ok")  # local
+    cache.reset_except("corp.local")
+    remaining = {(r[0], r[4]) for r in cache.list_valid()}
+    assert remaining == {("10.0.0.5", "corp.local")}   # everyone else (incl. local) wiped

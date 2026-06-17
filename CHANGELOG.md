@@ -9,6 +9,17 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 
 ## [Unreleased]
 
+### Added — scoped reset + time-clustered loot view
+- **`--reset DOMAIN`** wipes only that domain's loot / DC / BloodHound records
+  (`--reset` with no value still wipes everything); **`--reset-except DOMAIN`**
+  wipes everyone else and keeps that one. Use `--reset local` for the
+  domain-less local creds. Port scans (`host_ports`) have no domain, so scoped
+  resets leave them be. `--reset` and `--reset-except` are mutually exclusive.
+- **`--show` now clusters domain-less local creds by the day they were found**
+  (with the time per entry), while domain creds stay grouped by domain — so a
+  single engagement's local pwns sit together. `list_valid()` now also returns
+  each row's `attempted_at` timestamp.
+
 ### Changed — `-p` auto-detects hashes mixed into the password list
 - The `-p` pool now auto-detects NT (32 hex) and LM:NT (32:32 hex) entries and
   sprays them as **pass-the-hash**, using the same rule as `--combo`. So a

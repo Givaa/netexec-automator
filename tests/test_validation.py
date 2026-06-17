@@ -419,3 +419,13 @@ def test_combo_spray_requires_combo(tmp_path):
     )
     assert rc == 2
     assert "--combo-spray" in err
+
+
+def test_reset_and_reset_except_are_mutually_exclusive(tmp_path):
+    cache = tmp_path / "state.db"
+    rc, _, err = run_tool(
+        ["--reset", "a.local", "--reset-except", "b.local", "--cache-path", str(cache)],
+        cwd=tmp_path,
+    )
+    assert rc == 2
+    assert "mutually exclusive" in err.lower()

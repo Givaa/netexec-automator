@@ -853,7 +853,8 @@ class NxcAutomator:
             return ""
         pwn = sum(1 for r in rows if r[5])
         samples = []
-        for target, _proto, _la, user, _domain, pwn3d in rows[:2]:
+        for r in rows[:2]:
+            target, user, pwn3d = r[0], r[3], r[5]
             tag = f"{user or '<empty>'}@{target}"
             if pwn3d:
                 tag += " (Pwn3d!)"
@@ -886,30 +887,61 @@ class NxcAutomator:
     @staticmethod
     def print_loot_on_record(rows, cache_path=None):
         """Render accumulated valid creds — cache.list_valid() rows of
-        (target, protocol, local_auth, user, domain, pwn3d) — grouped by
-        domain. Shared by `--show` and the end-of-run reminder. Secrets are
-        never shown (only the hash is stored), so this is safe to print."""
+        (target, protocol, local_auth, user, domain, pwn3d, attempted_at) —
+        grouped by domain, with the domain-less local creds clustered by the day
+        they were found (their natural engagement association). Shared by --show
+        and the end-of-run reminder. Secrets are never shown (only the hash is
+        stored), so this is safe to print."""
         if not rows:
             loc = f" at {cache_path}" if cache_path else ""
             print(f"  {DIM}no valid credentials on record{loc} yet.{RESET}")
             return
-        grouped: dict[str, list] = {}
-        for target, proto, local_auth, user, domain, pwn3d in rows:
-            grouped.setdefault(domain or "(no domain / local)", []).append(
-                (target, proto, local_auth, user, pwn3d)
-            )
+
+        def _line(target, proto, local_auth, user, pwn3d, when=""):
+            scope = NxcAutomator._auth_scope(local_auth)
+            marker = f" {RED}{BOLD}(Pwn3d!){RESET}" if pwn3d else ""
+            when_s = f" {DIM}{when}{RESET}" if when else ""
+            return (f"        {GREEN}{user or '<empty>'}{RESET}{DIM}@{RESET}{target} "
+                    f"{DIM}[{proto}/{scope}]{RESET}{marker}{when_s}")
+
+        domain_groups: dict[str, list] = {}
+        local_rows: list = []
+        for r in rows:
+            target, proto, la, user, domain, pwn3d = r[0], r[1], r[2], r[3], r[4], r[5]
+            ts = r[6] if len(r) > 6 else 0
+            entry = (target, proto, la, user, pwn3d, ts)
+            if domain:
+                domain_groups.setdefault(domain, []).append(entry)
+            else:
+                local_rows.append(entry)
+
         total = len(rows)
         pwn = sum(1 for r in rows if r[5])
         head = f"{total} valid" + (f" · {pwn} Pwn3d" if pwn else "")
         print(f"\n  {ICON_FINDING} {CYAN}{BOLD}LOOT ON RECORD ({head}){RESET}")
-        for domain in sorted(grouped):
-            drows = grouped[domain]
-            print(f"     {BOLD}{domain}{RESET} {DIM}({len(drows)}){RESET}")
-            for target, proto, local_auth, user, pwn3d in drows:
-                scope = NxcAutomator._auth_scope(local_auth)
-                marker = f" {RED}{BOLD}(Pwn3d!){RESET}" if pwn3d else ""
-                print(f"        {GREEN}{user or '<empty>'}{RESET}{DIM}@{RESET}{target} "
-                      f"{DIM}[{proto}/{scope}]{RESET}{marker}")
+
+        # Domain is the natural grouping when we know it.
+        for domain in sorted(domain_groups):
+            entries = domain_groups[domain]
+            print(f"     {BOLD}{domain}{RESET} {DIM}({len(entries)}){RESET}")
+            for target, proto, la, user, pwn3d, ts in entries:
+                day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
+                print(_line(target, proto, la, user, pwn3d, when=day))
+
+        # Local / domain-less creds: cluster by the day they were found, so a
+        # single engagement's local pwns sit together (time is the association).
+        if local_rows:
+            by_day: dict[str, list] = {}
+            for entry in local_rows:
+                ts = entry[5]
+                day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else "unknown date"
+                by_day.setdefault(day, []).append(entry)
+            print(f"     {BOLD}local / no domain{RESET} {DIM}({len(local_rows)}){RESET}")
+            for day in sorted(by_day, reverse=True):
+                print(f"       {DIM}· {day}{RESET}")
+                for target, proto, la, user, pwn3d, ts in by_day[day]:
+                    hhmm = datetime.fromtimestamp(ts).strftime("%H:%M") if ts else ""
+                    print(_line(target, proto, la, user, pwn3d, when=hhmm))
         print()
 
     def _print_loot_reminder(self):
