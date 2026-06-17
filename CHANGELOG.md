@@ -9,6 +9,16 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 
 ## [Unreleased]
 
+### Fixed — domain creds wrongly shown under "local" in `--show`
+- Attempts were tagged in the cache with the `-d` value only, so without `-d`
+  (the common case — the domain is discovered from the SMB banner) domain-auth
+  creds had a NULL domain and fell into the "local / no domain" bucket. Now a
+  domain-auth attempt is tagged with the host's discovered domain (`host_domain`,
+  falling back to `-d`); local auth records no domain. `--show` also groups by
+  the auth **scope** — local-auth → local bucket, domain-auth → its domain (or
+  "domain (unknown)") — so a domain cred can never appear under local, even for
+  rows cached before this fix.
+
 ### Added — scoped reset + time-clustered loot view
 - **`--reset DOMAIN`** wipes only that domain's loot / DC / BloodHound records
   (`--reset` with no value still wipes everything); **`--reset-except DOMAIN`**

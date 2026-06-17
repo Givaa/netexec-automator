@@ -374,3 +374,37 @@ def test_password_pool_sprays_passwords_and_mixed_hashes(nxa, tmp_path):
         assert kinds == {"pwd", "hash"}, f"{u}: expected both pwd and hash, got {kinds}"
     assert all(c.nthash == "8846f7eaee8fb117ad06bdd830b7586c"
                for c in a.credentials if c.is_hash)
+
+
+def test_print_loot_domain_auth_never_under_local(nxa, capsys):
+    """Regression: a domain-auth cred (local_auth=False) must group under a
+    domain — named, or 'domain (unknown)' when none was recorded — never under
+    the local bucket. Local-auth creds go to local."""
+    rows = [
+        ("10.0.0.5", "smb", False, "admin", None, True, 0),       # domain auth, no domain stored
+        ("10.0.0.9", "smb", True,  "localadmin", None, False, 0), # local auth
+    ]
+    nxa.NxcAutomator.print_loot_on_record(rows)
+    out = strip_ansi(capsys.readouterr().out)
+    assert "domain (unknown)" in out
+    assert "local / no domain" in out
+    # the domain-auth cred is in the domain section, above the local section
+    assert out.index("admin@10.0.0.5") < out.index("local / no domain")
+    assert out.index("localadmin@10.0.0.9") > out.index("local / no domain")
+
+
+def test_domain_auth_records_discovered_domain_without_dash_d(nxa, tmp_path):
+    """Regression: without -d, a domain-auth attempt must still be tagged with
+    the host's domain discovered from the SMB banner (host_domain), so --show
+    groups it correctly. Local auth carries no domain."""
+    a = nxa.NxcAutomator(target="x", user="u", password="p", skip_tried=True,
+                         cache_path=str(tmp_path / "s.db"), no_banner=True)
+    assert a.domain is None  # no -d
+    a.host_domain["10.0.0.5"] = "corp.local"  # discovered via SMB banner
+    cred = a.credentials[0]
+    a._record_attempt_in_cache("10.0.0.5", "smb", False, cred, "fp1", "ok", True)   # domain auth
+    a._record_attempt_in_cache("10.0.0.5", "smb", True,  cred, "fp2", "ok", True)   # local auth
+    tagged = {(r[2], r[4]) for r in a.cache.list_valid()}  # (local_auth, domain)
+    a.cache.close()
+    assert (False, "corp.local") in tagged   # domain-auth tagged with discovered domain
+    assert (True, None) in tagged            # local-auth has no domain

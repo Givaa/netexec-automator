@@ -637,10 +637,15 @@ class NxcAutomator:
         is disabled."""
         if not (self.skip_tried and self.cache is not None):
             return
+        # Tag a domain-auth attempt with the host's actual domain — discovered
+        # from the SMB banner (host_domain) and falling back to -d — so --show
+        # groups it under its domain even when -d wasn't given. Local auth is
+        # host-local SAM, so it carries no domain.
+        attempt_domain = None if local_auth else (self.host_domain.get(target) or self.domain)
         try:
             self.cache.record_attempt(
                 target, protocol, local_auth, credential.user, secret_fp,
-                self.domain, result, pwn3d,
+                attempt_domain, result, pwn3d,
             )
         except Exception as exc:  # noqa: BLE001 — cache write should never break the spray
             self._vprint(V_VERBOSE, f"  {DIM}cache record_attempt failed: {exc}{RESET}")
@@ -910,10 +915,14 @@ class NxcAutomator:
             target, proto, la, user, domain, pwn3d = r[0], r[1], r[2], r[3], r[4], r[5]
             ts = r[6] if len(r) > 6 else 0
             entry = (target, proto, la, user, pwn3d, ts)
-            if domain:
-                domain_groups.setdefault(domain, []).append(entry)
-            else:
+            # Split on the auth SCOPE, not just the stored domain: a local-auth
+            # cred is host-local and goes to the time-clustered local bucket; a
+            # domain-auth cred always groups under a domain (named, or "domain
+            # (unknown)" when it was recorded without one) — never under local.
+            if la:
                 local_rows.append(entry)
+            else:
+                domain_groups.setdefault(domain or "domain (unknown)", []).append(entry)
 
         total = len(rows)
         pwn = sum(1 for r in rows if r[5])
