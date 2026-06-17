@@ -9,6 +9,14 @@ and dates are ISO 8601. Tags follow semver; entries grouped by tag below.
 
 ## [Unreleased]
 
+### Changed — `-p` auto-detects hashes mixed into the password list
+- The `-p` pool now auto-detects NT (32 hex) and LM:NT (32:32 hex) entries and
+  sprays them as **pass-the-hash**, using the same rule as `--combo`. So a
+  single `-p` list mixing passwords and hashes works: every user is tried with
+  all passwords **and** all hashes. (`-H` stays the explicit, validated hash
+  list.) The detection is now a shared `_make_secret_cred` helper used by both
+  `--combo` and `-p`.
+
 ### Added — `--combo-spray` + host-centric recap
 - **`--combo-spray`**: with `--combo`, treat the file's users and secrets as
   pools and spray every secret against every user (cartesian), like

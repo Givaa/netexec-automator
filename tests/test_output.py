@@ -341,3 +341,32 @@ def test_combo_spray_expands_to_cartesian(nxa, tmp_path):
         ("alice", "Spring1"), ("alice", "Summer2"),
         ("bob", "Spring1"), ("bob", "Summer2"),
     }
+
+
+# ---- -p pool auto-detects hashes mixed into the password list -----------
+
+def test_make_secret_cred_detects_hash_vs_password(nxa):
+    C = nxa.NxcAutomator._make_secret_cred
+    assert C("u", "Password123").password == "Password123"
+    nt = C("u", "8846f7eaee8fb117ad06bdd830b7586c")
+    assert nt.is_hash and nt.nthash == "8846f7eaee8fb117ad06bdd830b7586c"
+    lmnt = C("u", "aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c")
+    assert lmnt.is_hash and lmnt.lmhash == "aad3b435b51404eeaad3b435b51404ee"
+
+
+def test_password_pool_sprays_passwords_and_mixed_hashes(nxa, tmp_path):
+    """A -p list with hashes mixed among the passwords: every user is tried
+    with all passwords AND all those hashes (pass-the-hash), not the hash as a
+    literal password."""
+    users = tmp_path / "u.txt"; users.write_text("alice\nbob\n")
+    pwds = tmp_path / "p.txt"
+    pwds.write_text("Spring2025\n8846f7eaee8fb117ad06bdd830b7586c\n")  # 1 password + 1 NT hash
+    a = nxa.NxcAutomator(target="x", user=str(users), password=str(pwds), no_banner=True)
+    by_user: dict[str, list] = {}
+    for c in a.credentials:
+        by_user.setdefault(c.user, []).append(c)
+    for u in ("alice", "bob"):
+        kinds = {("hash" if c.is_hash else "pwd") for c in by_user[u]}
+        assert kinds == {"pwd", "hash"}, f"{u}: expected both pwd and hash, got {kinds}"
+    assert all(c.nthash == "8846f7eaee8fb117ad06bdd830b7586c"
+               for c in a.credentials if c.is_hash)

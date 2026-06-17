@@ -164,7 +164,9 @@ def _build_parser():
     g_auth.add_argument("-u", "--user",
                         help="Username, or path to users.txt.")
     g_auth.add_argument("-p", "--password",
-                        help="Password, or path to passwords.txt.")
+                        help="Password, or path to passwords.txt. NT / LM:NT hashes mixed into the "
+                             "list are auto-detected and sprayed as pass-the-hash, so every user is "
+                             "tried with all passwords + hashes.")
     g_auth.add_argument("-H", "--hash", dest="nthash",
                         help="NT hash (32 hex), LM:NT (32:32 hex), or path to hashes.txt.")
     g_auth.add_argument("-d", "--domain",

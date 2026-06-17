@@ -324,10 +324,26 @@ class NxcAutomator:
             f"Invalid hash {v!r}: expected 32 hex chars (NT) or 32:32 hex (LM:NT)."
         )
 
+    @staticmethod
+    def _make_secret_cred(user: str, secret: str) -> Credential:
+        """Build a Credential from a raw secret, auto-detecting an NT (32 hex)
+        or LM:NT (32:32 hex) hash vs a plaintext password. Shared by the combo
+        parser and the -p pool, so a hash sitting in a password list is sprayed
+        as pass-the-hash rather than as a literal password. The password form
+        keeps the original string (surrounding whitespace may be significant)."""
+        probe = secret.strip()
+        if HASH_LMNT_PATTERN.match(probe):
+            lm, nt = probe.split(":", 1)
+            return Credential(user=user, lmhash=lm, nthash=nt)
+        if HASH_NT_PATTERN.match(probe):
+            return Credential(user=user, nthash=probe)
+        return Credential(user=user, password=secret)
+
     @classmethod
     def _parse_combo_line(cls, line: str) -> Credential | None:
-        """Parse one 'user:secret' line. Auto-detects whether secret is NT/LM:NT hash
-        or password. Returns None for blank or comment lines."""
+        """Parse one 'user:secret' line (split on the FIRST ':'). Auto-detects
+        whether secret is NT/LM:NT hash or password. Returns None for blank or
+        comment lines."""
         raw = line.rstrip("\n\r")
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
@@ -335,14 +351,7 @@ class NxcAutomator:
         if ":" not in stripped:
             raise ValueError(f"Malformed combo line (missing ':'): {stripped!r}")
         user, _, secret = raw.partition(":")
-        user = user.strip()
-        # Don't strip the secret — passwords may legitimately have surrounding whitespace.
-        if HASH_LMNT_PATTERN.match(secret.strip()):
-            lm, nt = secret.strip().split(":", 1)
-            return Credential(user=user, lmhash=lm, nthash=nt)
-        if HASH_NT_PATTERN.match(secret.strip()):
-            return Credential(user=user, nthash=secret.strip())
-        return Credential(user=user, password=secret)
+        return cls._make_secret_cred(user.strip(), secret)
 
     @classmethod
     def _load_combo_file(cls, path: str) -> list[Credential]:
@@ -423,8 +432,11 @@ class NxcAutomator:
 
         if self.mode == "combination":
             for u in self.users:
+                # -p entries auto-detect hashes mixed into the password list, so
+                # every user is tried with all passwords AND all such hashes.
                 for p in self.passwords:
-                    creds.append(Credential(user=u, password=p))
+                    creds.append(self._make_secret_cred(u, p))
+                # -H entries are explicitly hashes (validated, error on malformed).
                 for h in self.hashes:
                     lm, nt = self._parse_hash_value(h)
                     creds.append(Credential(user=u, lmhash=lm, nthash=nt))
@@ -441,7 +453,7 @@ class NxcAutomator:
                     "Linear mode requires user and secret lists to have the same length."
                 )
             if self.passwords:
-                creds.extend(Credential(user=u, password=p) for u, p in zip(self.users, pool))
+                creds.extend(self._make_secret_cred(u, p) for u, p in zip(self.users, pool))
             else:
                 for u, h in zip(self.users, pool):
                     lm, nt = self._parse_hash_value(h)
